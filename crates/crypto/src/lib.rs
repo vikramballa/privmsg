@@ -239,8 +239,12 @@ impl Session {
     }
 
     /// Bob joins from the serialized `Welcome` Alice sent.
+    ///
+    /// The group creator picks the group id, so a Welcome reusing the id of
+    /// a group we are already in is refused: joining would overwrite that
+    /// conversation's state.
     pub fn join(id: &Identity, welcome_bytes: &[u8]) -> Result<Self> {
-        let msg_in = MlsMessageIn::tls_deserialize(&mut &welcome_bytes[..])
+        let msg_in = MlsMessageIn::tls_deserialize_exact(welcome_bytes)
             .map_err(|e| anyhow!("deserialize welcome: {e:?}"))?;
 
         let welcome = match msg_in.extract() {
@@ -248,13 +252,22 @@ impl Session {
             _ => return Err(anyhow!("expected a Welcome message")),
         };
 
-        let staged = StagedWelcome::new_from_welcome(
+        let processed = ProcessedWelcome::new_from_welcome(
             &id.provider,
             &MlsGroupJoinConfig::default(),
             welcome,
-            None, // ratchet tree delivered out of band if needed
         )
-        .map_err(|e| anyhow!("stage welcome: {e:?}"))?;
+        .map_err(|e| anyhow!("process welcome: {e:?}"))?;
+        let group_id = processed.unverified_group_info().group_id().clone();
+        if MlsGroup::load(id.provider.storage(), &group_id)
+            .map_err(|e| anyhow!("check existing group: {e:?}"))?
+            .is_some()
+        {
+            return Err(anyhow!("welcome reuses the id of an existing group"));
+        }
+        let staged = processed
+            .into_staged_welcome(&id.provider, None) // ratchet tree is in-band
+            .map_err(|e| anyhow!("stage welcome: {e:?}"))?;
 
         let group = staged
             .into_group(&id.provider)
@@ -275,7 +288,7 @@ impl Session {
 
     /// Decrypt an application message received from the transport layer.
     pub fn decrypt(&mut self, id: &Identity, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let msg_in = MlsMessageIn::tls_deserialize(&mut &ciphertext[..])
+        let msg_in = MlsMessageIn::tls_deserialize_exact(ciphertext)
             .map_err(|e| anyhow!("deserialize message: {e:?}"))?;
 
         let protocol_msg: ProtocolMessage = msg_in
@@ -397,6 +410,31 @@ mod tests {
         assert_eq!(message_group_id(&ct)?, a.group_id());
         assert_eq!(a.group_id(), b.group_id());
         assert!(message_group_id(b"not mls").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn welcome_for_an_existing_group_is_refused() -> Result<()> {
+        // Mallory holds one of Bob's key packages and builds a group whose id
+        // collides with Bob's conversation with Alice.
+        let (_alice, a, bob, _b) = pair()?;
+        let mallory = Identity::new("mallory-local-label")?;
+        let config = MlsGroupCreateConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+        let group = MlsGroup::new_with_group_id(
+            &mallory.provider,
+            &mallory.signer,
+            &config,
+            GroupId::from_slice(&a.group_id()),
+            mallory.credential.clone(),
+        )
+        .map_err(|e| anyhow!("{e:?}"))?;
+        let mut evil = Session { group };
+        let welcome = evil.add_member(&mallory, bob.key_package()?)?;
+        let err = Session::join(&bob, &welcome).err().unwrap();
+        assert!(err.to_string().contains("existing group"));
+        assert!(Session::load(&bob, &a.group_id()).is_ok(), "untouched");
         Ok(())
     }
 

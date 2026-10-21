@@ -15,9 +15,11 @@ both:
   observer watching the network can't tell who is talking to whom.
 - 🙈 **No accounts.** No phone number, no email, no username. You connect
   with someone by swapping a one-time invite code.
+- 🧩 **A different address for every contact**, replaced every week, so
+  your conversations can't be linked to each other by address.
 
-> ⚠️ **Status: early prototype (Phase 1 of 3).** It works end to end on the
-> live Nym network, but it has **not been security-audited**. Please don't
+> ⚠️ **Status: prototype.** It works end to end on the live Nym network,
+> but it has **not been independently security-audited**. Please don't
 > rely on it for anything sensitive yet.
 
 ---
@@ -28,6 +30,7 @@ both:
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Where your data lives](#where-your-data-lives)
+- [Addresses, rotation and decoys](#addresses-rotation-and-decoys)
 - [What it protects (and what it doesn't)](#what-it-protects-and-what-it-doesnt)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
@@ -70,73 +73,71 @@ and the encryption layer never sees an IP address. The full design is in
 
 ## Install
 
-**You need:** macOS or Linux, and [Rust](https://rustup.rs) installed via
-`rustup` (the right compiler version is picked automatically).
+You need a Mac or a Linux computer.
+
+**1. Install Rust** (one time). Open Terminal and run the command shown at
+[rustup.rs](https://rustup.rs), then open a new Terminal window.
+
+**2. Download and install privmsg:**
 
 ```bash
 git clone https://github.com/vikramballa/privmsg.git
 cd privmsg
-cargo build --release
+./scripts/install.sh
 ```
 
-The first build takes a few minutes (it compiles the Nym networking
-library). The program ends up at `./target/release/privmsg`. Optionally copy
-it somewhere on your `PATH`:
+The first build takes a few minutes. After that you can open privmsg from
+any Terminal window by typing `privmsg`.
 
-```bash
-cp target/release/privmsg ~/.local/bin/     # or /usr/local/bin
-```
-
-Check it works (no network needed):
-
-```bash
-privmsg selftest
-# selftest OK: MLS content layer verified end to end (no network).
-```
+*(Ready-made downloads will appear on the
+[Releases page](https://github.com/vikramballa/privmsg/releases) once a
+version is published.)*
 
 ---
 
 ## Quick start
 
-Two people, **Alice** and **Bob**, each on their own computer.
-
-**1. Both create a profile** (you'll choose a passphrase; it encrypts
-everything privmsg saves):
+**1. Open privmsg:**
 
 ```bash
-privmsg init
+privmsg
 ```
 
-**2. Bob creates an invite for Alice:**
+The first time, it asks you to choose a password (at least 8 characters).
+It locks your messages on this computer, and it can't be recovered. On a
+Mac it offers to remember the password in your Keychain so you don't have
+to type it again.
 
-```bash
-privmsg invite alice
-# privmsg1:hjVoYkhNZ01vblNDQWRnaVVSeG82S2JnR0t...
-```
+**2. Invite a friend:** press **Ctrl-N**, type a name for them (only you
+see it), and press **Enter**. Your invite code is shown and **copied to
+your clipboard**. Paste it to your friend any way you like (WhatsApp,
+Signal, email, a text). Each code works **once**.
 
-Bob sends that code to Alice **over a channel he trusts**: in person, as a
-QR code, or through another secure app. Each code works **once**.
+**3. Your friend enters it:** in their privmsg they press **Ctrl-O**, paste
+the code, press **Enter**, then type a name for you and press **Enter**.
 
-**3. Alice accepts it**, choosing what she wants to call Bob:
+**4. Chat:** your friend shows up in your contact list. Type a message
+and press **Enter**.
 
-```bash
-privmsg add bob 'privmsg1:hjVoYkhNZ01vblNDQWRnaVVSeG82S2JnR0t...'
-```
+| Key | What it does |
+|---|---|
+| **Ctrl-N** | Invite a friend |
+| **Ctrl-O** | Enter an invite code someone sent you |
+| **↑ / ↓** | Switch between conversations |
+| **Enter** | Send |
+| **Esc** | Cancel, or quit |
 
-**4. Chat:**
+💡 Your friend doesn't need to be online. Messages wait on the Nym network
+and arrive the next time they open privmsg.
 
-```bash
-privmsg chat bob        # Alice
-privmsg chat alice      # Bob
-```
+💡 Connecting takes about 10 seconds, and each message takes a few seconds
+to arrive. That delay is part of what makes the traffic hard to analyse.
 
-Type a message and press Enter. Type `/quit` to leave.
+💡 Whoever uses an invite first becomes that contact, so send codes in a
+chat you trust. Once connected, check it's really your friend.
 
-💡 Your contact doesn't need to be online. Messages wait at their Nym gateway
-and arrive the next time they connect.
-
-💡 Connecting takes a few seconds, and each message takes a moment to
-arrive. That small delay is part of what makes the traffic hard to analyse.
+**Just want to see it work?** `./scripts/try-it.sh` creates two test
+users on your computer, connects them, and opens a chat window for each.
 
 ---
 
@@ -144,15 +145,21 @@ arrive. That small delay is part of what makes the traffic hard to analyse.
 
 | Command | What it does |
 |---|---|
-| `privmsg init` | Create a new encrypted profile |
-| `privmsg invite <name>` | Make a one-time invite code; whoever uses it is saved as `<name>` |
+| `privmsg` | Open the app (sets it up the first time) |
+| `privmsg init` | Create a new encrypted profile without opening the app |
+| `privmsg invite <name> [--qr]` | Make a one-time invite code (optionally as a QR code); whoever uses it is saved as `<name>` |
 | `privmsg add <name> <code>` | Accept someone's invite and save them as `<name>` |
-| `privmsg chat <name>` | Interactive chat (`/quit` to leave) |
-| `privmsg send <name> <message>` | Send a single message and exit |
+| `privmsg ui` | Same as plain `privmsg` |
+| `privmsg chat <name>` | Line-by-line chat (`/quit` to leave) |
+| `privmsg send <name> <message>` | Send a single message and exit (up to 16 KiB) |
 | `privmsg listen [seconds]` | Just receive messages (Ctrl-C to stop) |
-| `privmsg contacts` | List contacts and unused invites |
+| `privmsg contacts` | List contacts, unread counts and unused invites |
 | `privmsg history <name>` | Show saved messages with a contact |
-| `privmsg address` | Print your Nym mix address |
+| `privmsg rotate <name>` | Move a conversation to a new address now (it also happens weekly by itself) |
+| `privmsg remove <name>` | Forget a contact or unused invite, with its addresses and keys |
+| `privmsg address` | Show your mix address for each contact |
+| `privmsg decoys [on\|off\|<seconds>]` | Show or set decoy traffic (see below) |
+| `privmsg keychain save` / `forget` | Keep the passphrase in the macOS keychain so privmsg stops asking, or remove it |
 | `privmsg selftest` | Offline check of the encryption layer |
 
 **Options and environment variables**
@@ -162,7 +169,7 @@ arrive. That small delay is part of what makes the traffic hard to analyse.
 | `--data-dir <dir>` | Use a different profile folder (handy for running two profiles on one machine) |
 | `PRIVMSG_HOME` | Default profile folder (otherwise `~/.privmsg`) |
 | `PRIVMSG_PASSPHRASE` | Supply the passphrase non-interactively, for scripts. ⚠️ Avoid on shared machines |
-| `RUST_LOG` | Log detail, e.g. `RUST_LOG=debug` |
+| `RUST_LOG` | Log detail, e.g. `RUST_LOG=debug`. In the app, logs go to `privmsg.log` in the profile folder |
 
 ---
 
@@ -173,11 +180,41 @@ Everything is in your profile folder (default `~/.privmsg`):
 | File | Contents | Protected? |
 |---|---|---|
 | `state.enc` | Your keys, contacts, conversations, message history | ✅ Encrypted with your passphrase (Argon2id + XChaCha20-Poly1305) |
-| `nym/` | Your Nym network keys and gateway registration | ⚠️ Not encrypted by privmsg (only by folder permissions) |
+| `slots/` | One folder of Nym network keys per address (one per contact and per open invite) | ⚠️ Not encrypted by privmsg (only by folder permissions) |
 | `lock` | Stops two copies of privmsg using the same profile | — |
 
 🔑 **There is no password recovery.** If you forget your passphrase, your
 profile can't be opened. That's by design.
+
+Profiles made by older versions are upgraded automatically the first time
+you open them. Your existing contacts then move to fresh addresses of their
+own the next time you're connected (both sides need the new version).
+
+---
+
+## Addresses, rotation and decoys
+
+**One address per contact.** Every invite you create, and every invite you
+accept, gets its own Nym address (its own keys and a randomly chosen
+gateway). Two people you talk to can't compare notes and find out they're
+talking to the same person.
+
+**Weekly rotation.** Each conversation's address is replaced every 7 days
+while you're connected (or on demand with `privmsg rotate <name>`). Your
+contact is told the new address inside the encrypted conversation and
+confirms it; the old address keeps listening for a day after that, then its
+keys are deleted.
+
+**Decoys (optional).** `privmsg decoys on` makes each conversation send
+something at random moments (every ~10 s on average) whenever you're in
+`ui`, `chat` or `listen`. That's either a waiting message or a meaningless
+decoy, so someone counting packets can't tell when you actually write.
+The cost is bandwidth and a delay of a few seconds per message.
+`privmsg decoys 30` picks a different average; `privmsg decoys off` turns
+them off. A one-off `privmsg send` always goes out immediately.
+
+Each address is a separate Nym client with its own cover traffic, so many
+contacts means more background traffic. That's expected.
 
 ---
 
@@ -193,13 +230,18 @@ profile can't be opened. That's by design.
   your device, and invite codes work only once.
 - **Data on disk:** encrypted with your passphrase.
 
-**Not protected yet ⚠️**
-- **One address per profile:** every invite you create contains the same
-  mix address, so people holding two of your invites can tell they came from
-  the same person. *(Fix planned: Phase 2.)*
+- **Linking your conversations:** each contact gets its own address, and
+  addresses rotate weekly.
+- **When you write:** with decoys on, real messages are hidden among decoys.
+
+**Not protected ⚠️**
+- **Gateways working together:** all your addresses connect from the same
+  IP address. Each gateway sees your IP, so gateway operators who pooled
+  their logs could link your addresses.
 - **Long-term traffic analysis by a very powerful observer:** cover traffic
-  helps a lot, but there's no formal guarantee yet. *(Phase 3.)*
-- **The `nym/` folder** isn't encrypted by privmsg.
+  and decoys help a lot, but there's no formal guarantee. Being online at
+  all is still visible.
+- **The `slots/` folder** isn't encrypted by privmsg.
 - **A hacked device:** if someone controls your computer, no messenger can
   protect you.
 - **Small user base:** a mixnet hides you in a crowd, so the more people use
@@ -216,6 +258,9 @@ profile can't be opened. That's by design.
 | `wrong passphrase, or the profile is corrupted` | Check your passphrase. |
 | `no profile in … (run privmsg init first)` | Create a profile, or point `--data-dir` at the right folder. |
 | `refused a join that does not match any open invite` | Someone used an invite that was already used or never existed. Make a fresh invite. |
+| `… has not confirmed the last address change yet` | Your contact hasn't been online since your last rotation. It completes by itself; try `rotate` again later. |
+| `message is … bytes; the limit is 16384` | Split long text into several messages. |
+| Asked for a passphrase although you used `keychain save` | The keychain entry is tied to the profile folder's path. Run `keychain save` again for that folder. |
 | Messages are slow | Normal mixnet delay. If nothing arrives, check your internet connection and that both sides are running a recent build. |
 
 ---
@@ -229,18 +274,20 @@ profile can't be opened. That's by design.
   - [x] Encrypted local profile, message history
   - [x] Offline delivery
 - [ ] **Hardening**
-  - [ ] Fuzz testing of all network input
-  - [ ] Independent security review
-  - [ ] Optional passphrase storage in the OS keychain
-- [ ] **Phase 2: unlinkable conversations**
-  - [ ] Separate mix address per contact
-  - [ ] Automatic address rotation
-- [ ] **Usability**
-  - [ ] Full-screen terminal UI (contact list, unread counts)
-  - [ ] QR-code invites
-  - [ ] Prebuilt releases for macOS and Linux
-- [ ] **Phase 3: stronger metadata privacy**
-  - [ ] Decoy-traffic scheduler, following the Vuvuzela/Loopix research
+  - [x] Fuzz testing of all network input (`fuzz/`)
+  - [x] Internal security review pass
+  - [ ] Independent security audit
+  - [x] Optional passphrase storage in the OS keychain (macOS)
+- [x] **Phase 2: unlinkable conversations**
+  - [x] Separate mix address per contact
+  - [x] Automatic address rotation
+- [x] **Usability**
+  - [x] Full-screen terminal UI (contact list, unread counts)
+  - [x] QR-code invites
+  - [x] Prebuilt releases for macOS and Linux (GitHub Actions, on version tags)
+- [x] **Phase 3: stronger metadata privacy**
+  - [x] Decoy-traffic scheduler (Loopix-style constant-rate sending; no
+        formal differential-privacy guarantee)
 
 Ideas and bug reports are welcome. Please open an issue.
 
@@ -253,19 +300,38 @@ Ideas and bug reports are welcome. Please open an issue.
 ```
 crates/
   crypto/      Layer 1: MLS via OpenMLS (identities, groups, persistence)
-  transport/   Layer 2: Nym mixnet client, padding, in-memory test network
-  node/        The privmsg app: encrypted profile, wire format, invites, CLI
+  transport/   Layer 2: Nym clients per slot, multiplexer, padding, test network
+  node/        The privmsg app: profile, wire format, invites, rotation,
+               decoys (library), plus the CLI and terminal UI (binary)
+fuzz/          cargo-fuzz targets for everything read from the network
 docs/
-  ARCHITECTURE.md   Design, wire format, threat model, future plug-in points
+  ARCHITECTURE.md   Design, wire format, threat model
+.github/workflows/  CI (fmt, clippy, tests) and release builds
 ```
 
 **Build and test**
 
 ```bash
-cargo test --workspace          # 38 tests, no network needed
+cargo test --workspace          # 60 tests, no network needed
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
+
+**Fuzzing** (needs nightly and `cargo install cargo-fuzz`):
+
+```bash
+cd fuzz
+cargo +nightly fuzz run unpad           # also: invite_code, wire_decode
+cargo +nightly fuzz run -O handle_incoming
+```
+
+`-O` matters for `handle_incoming`. Without it, debug assertions are on,
+and OpenMLS hits a `debug_assert!(false)` on every failed decryption, which
+is exactly what that fuzzer produces. The targets build without the `nym`
+feature, so they don't compile the Nym tree at all.
+
+**Releases:** pushing a tag like `v0.2.0` makes GitHub Actions build and
+publish macOS and Linux binaries as a pre-release.
 
 The Rust version is pinned in `rust-toolchain.toml` so everyone builds with
 the same compiler.

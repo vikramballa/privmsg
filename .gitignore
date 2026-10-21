@@ -12,6 +12,8 @@ state.enc.tmp
 /**/lock
 # Nym client keys, gateway registration and credential databases
 nym/
+slots/
+privmsg.log
 
 # Editors / OS
 .DS_Store

@@ -4,7 +4,8 @@
 //! transport frame (padded, Sphinx-wrapped by Nym)
 //!   └─ Envelope::Join { welcome, hello }   first contact
 //!      Envelope::Mls(ciphertext)           everything after
-//!         └─ MLS-encrypted Payload::Hello / Payload::Text
+//!         └─ MLS-encrypted Payload::Hello / Text / Rotate / RotateAck
+//!      Envelope::Decoy(random)             cover, discarded on arrival
 //! ```
 //!
 //! Nothing identifying travels outside MLS encryption: the joiner's return
@@ -58,8 +59,11 @@ impl Invite {
         ))
     }
 
+    /// Whitespace anywhere is ignored, so a code that was wrapped across
+    /// lines when copied still works.
     pub fn from_code(code: &str) -> Result<Self> {
-        let body = code.trim().strip_prefix(INVITE_PREFIX).ok_or_else(|| {
+        let code: String = code.split_whitespace().collect();
+        let body = code.strip_prefix(INVITE_PREFIX).ok_or_else(|| {
             anyhow!("not a privmsg invite (expected it to start with {INVITE_PREFIX})")
         })?;
         let bytes = URL_SAFE_NO_PAD
@@ -76,6 +80,10 @@ pub enum Envelope {
     Join { welcome: Vec<u8>, hello: Vec<u8> },
     /// An MLS application message for an existing conversation.
     Mls(Vec<u8>),
+    /// Random filler sent instead of a real message when decoys are on.
+    /// Sphinx encryption makes it look like any other packet to everyone
+    /// but the recipient, who throws it away.
+    Decoy(Vec<u8>),
 }
 
 /// Plaintext carried inside MLS application messages.
@@ -86,6 +94,20 @@ pub enum Payload {
         invite_tag: [u8; 16],
     },
     Text(String),
+    /// "From now on, write to me at `reply_to`." Sent when we rotate the
+    /// address we receive this conversation on.
+    Rotate {
+        reply_to: String,
+    },
+    /// Sent to our new address on receiving a `Rotate`, so the old one can
+    /// be retired.
+    RotateAck,
+}
+
+/// Plausibility check for a mix address received from a peer. The transport
+/// does the real parsing when we send; this keeps junk out of the profile.
+pub fn valid_address(address: &str) -> bool {
+    !address.is_empty() && address.len() <= 512 && address.chars().all(|c| c.is_ascii_graphic())
 }
 
 #[cfg(test)]
@@ -105,6 +127,12 @@ mod tests {
         let code = invite().to_code()?;
         assert!(code.starts_with(INVITE_PREFIX));
         assert_eq!(Invite::from_code(&format!("  {code}\n"))?, invite());
+        let (a, b) = code.split_at(30);
+        assert_eq!(
+            Invite::from_code(&format!("{a}\n  {b}"))?,
+            invite(),
+            "wrapped"
+        );
         Ok(())
     }
 

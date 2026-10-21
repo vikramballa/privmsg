@@ -3,15 +3,20 @@ name = "privmsg-node"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Phase 1 node: runs MLS-encrypted messages over the Nym mixnet, end to end."
+description = "The privmsg messenger: MLS-encrypted conversations over the Nym mixnet."
 
 [[bin]]
 name = "privmsg"
 path = "src/main.rs"
+required-features = ["nym"]
+
+[features]
+default = ["nym"]
+nym = ["privmsg-transport/nym"]
 
 [dependencies]
 privmsg-crypto = { path = "../crypto" }
-privmsg-transport = { path = "../transport" }
+privmsg-transport = { path = "../transport", default-features = false }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -23,6 +28,17 @@ rpassword = { workspace = true }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 zeroize = { workspace = true }
+futures = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+qrcode = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints.rust]
+# `cargo fuzz` builds with `--cfg fuzzing`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

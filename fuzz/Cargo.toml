@@ -1,0 +1,50 @@
+# Fuzz targets for everything privmsg reads from the network or from users.
+# Separate workspace: needs nightly (`cargo +nightly fuzz run <target>`).
+# Built without the `nym` feature: the targets use the in-memory network.
+[package]
+name = "privmsg-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+futures = "0.3"
+tempfile = "3"
+privmsg-crypto = { path = "../crates/crypto" }
+privmsg-node = { path = "../crates/node", default-features = false }
+privmsg-transport = { path = "../crates/transport", default-features = false }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "unpad"
+path = "fuzz_targets/unpad.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invite_code"
+path = "fuzz_targets/invite_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handle_incoming"
+path = "fuzz_targets/handle_incoming.rs"
+test = false
+doc = false
+bench = false

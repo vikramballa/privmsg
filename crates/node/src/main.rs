@@ -1,5 +1,5 @@
-//! Phase 1 node — wires Layer 1 (MLS content encryption) on top of
-//! Layer 2 (Nym mixnet transport) and runs two-party conversations end to end.
+//! privmsg — wires Layer 1 (MLS content encryption) on top of
+//! Layer 2 (Nym mixnet transport) and runs conversations end to end.
 //!
 //! The flow this binary implements:
 //!
@@ -13,40 +13,50 @@
 //! No layer sees more than its job: the mixnet never sees plaintext; the
 //! crypto layer never sees IPs. That separation is the whole design.
 //!
-//! `app` holds the messenger logic, `store` the encrypted profile, `wire`
-//! the on-the-wire formats. This file is only the command line.
+//! The logic lives in the `privmsg_node` library (`app` the messenger,
+//! `store` the encrypted profile, `wire` the formats, `decoy` the decoy
+//! scheduler). This file is the command line; `tui` is the full-screen UI.
 
-mod app;
-mod store;
-mod wire;
+mod keychain;
+mod tui;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use privmsg_crypto::{Identity, Session};
-use privmsg_transport::{NymTransport, Transport};
+use privmsg_node::app::{Event, Node};
+use privmsg_node::decoy::{self, Scheduler};
+use privmsg_node::store::{HistoryEntry, Profile, Settings};
+use privmsg_transport::{Mux, NymNetwork};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
-
-use app::{Event, Node};
 
 const USAGE: &str = "\
 privmsg — metadata-private messenger (MLS over the Nym mixnet)
 
-usage: privmsg [--data-dir DIR] <command>
+usage: privmsg [--data-dir DIR] [command]
+
+Just `privmsg` opens the app (and sets it up the first time).
 
 commands:
   init                    create a new encrypted profile
-  address                 print your mix address
-  invite <name>           make a one-time invite; whoever uses it becomes <name>
+  invite <name> [--qr]    make a one-time invite; whoever uses it becomes <name>
   add <name> <invite>     accept someone's invite and save them as <name>
-  contacts                list contacts and open invites
+  ui                      the app (same as plain `privmsg`)
+  chat <name>             line-by-line chat with <name> (/quit to leave)
   send <name> <message>   send one message
   listen [seconds]        receive messages until Ctrl-C (or for <seconds>)
-  chat <name>             interactive chat with <name> (/quit to leave)
+  contacts                list contacts, unread counts and open invites
   history <name>          show saved messages with <name>
+  rotate <name>           move the conversation with <name> to a new address
+  remove <name>           forget a contact or unused invite and its addresses
+  address                 show your mix address for each contact
+  decoys [on|off|<secs>]  show or set decoy traffic (mean seconds between sends)
+  keychain save|forget    keep the passphrase in the macOS keychain, or stop
   selftest                offline check of the encryption layer
 
 environment:
@@ -61,34 +71,63 @@ environment:
 const DEFAULT_LOG: &str =
     "warn,privmsg=info,nym_gateway_client::packet_router=error,nym_gateway_client::traits=off";
 
+/// Decoy interval used by `privmsg decoys on`.
+const DEFAULT_DECOY_INTERVAL: u32 = 10;
+
+/// How often a running session checks for address rotation and retirement.
+pub(crate) const MAINTENANCE_EVERY: Duration = Duration::from_secs(60);
+
+pub(crate) type Network = Mux<NymNetwork>;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG)),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let data_dir = take_data_dir(&mut args)?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
+    // Logs would draw over the full-screen app, which shows problems itself.
+    // With RUST_LOG set they go to `privmsg.log` in the profile instead.
+    let ui = matches!(args.as_slice(), [] | ["ui"]);
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(if ui { "off" } else { DEFAULT_LOG }));
+    let logger = tracing_subscriber::fmt().with_env_filter(filter);
+    if ui && std::env::var_os("RUST_LOG").is_some() {
+        std::fs::create_dir_all(&data_dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("privmsg.log"))?;
+        logger
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+    } else {
+        logger.with_writer(std::io::stderr).init();
+    }
+
     match args.as_slice() {
         ["selftest"] => selftest(),
         ["init"] => init(data_dir),
-        ["address"] => address(data_dir).await,
-        ["invite", name] => invite(data_dir, name).await,
+        ["address"] => address(data_dir),
+        ["invite", name] => invite(data_dir, name, false).await,
+        ["invite", name, "--qr"] | ["invite", "--qr", name] => invite(data_dir, name, true).await,
         ["add", name, code] => add(data_dir, name, code).await,
         ["contacts"] => contacts(data_dir),
         ["send", name, words @ ..] if !words.is_empty() => {
             send(data_dir, name, &words.join(" ")).await
         }
-        ["listen"] => listen(data_dir, None).await,
-        ["listen", secs] => listen(data_dir, Some(secs.parse()?)).await,
-        ["chat", name] => chat(data_dir, name).await,
+        ["listen"] => session(data_dir, None, None).await,
+        ["listen", secs] => session(data_dir, None, Some(secs.parse()?)).await,
+        ["chat", name] => session(data_dir, Some(name), None).await,
+        [] | ["ui"] => start(data_dir).await,
         ["history", name] => history(data_dir, name),
-        [] | ["help"] | ["-h"] | ["--help"] => {
+        ["rotate", name] => rotate(data_dir, name).await,
+        ["remove", name] => remove(data_dir, name).await,
+        ["decoys"] => decoys(data_dir, None),
+        ["decoys", setting] => decoys(data_dir, Some(setting)),
+        ["keychain", "save"] => keychain_save(data_dir),
+        ["keychain", "forget"] => keychain_forget(data_dir),
+        ["help"] | ["-h"] | ["--help"] => {
             println!("{USAGE}");
             Ok(())
         }
@@ -112,31 +151,105 @@ fn take_data_dir(args: &mut Vec<String>) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".privmsg"))
 }
 
-fn passphrase(confirm: bool) -> Result<Zeroizing<String>> {
-    let pass = match std::env::var("PRIVMSG_PASSPHRASE") {
-        Ok(p) => Zeroizing::new(p),
-        Err(_) => {
-            let p = Zeroizing::new(rpassword::prompt_password("passphrase: ")?);
-            if confirm && *p != *Zeroizing::new(rpassword::prompt_password("repeat passphrase: ")?)
-            {
-                bail!("passphrases do not match");
-            }
-            p
-        }
-    };
-    if confirm && pass.chars().count() < 8 {
-        bail!("use a passphrase of at least 8 characters");
+/// The passphrase from `PRIVMSG_PASSPHRASE` or the keychain, if either
+/// has one.
+fn stored_passphrase(dir: &Path) -> Option<Zeroizing<String>> {
+    match std::env::var("PRIVMSG_PASSPHRASE") {
+        Ok(p) => Some(Zeroizing::new(p)),
+        Err(_) => keychain::get(dir),
     }
-    Ok(pass)
 }
 
+/// Unlock the profile in `dir`: with the stored passphrase if there is one,
+/// otherwise by asking (three tries).
 fn open(dir: &Path) -> Result<Node> {
-    Node::open(dir, &passphrase(false)?)
+    if let Some(pass) = stored_passphrase(dir) {
+        return Node::open(dir, &pass);
+    }
+    if !Profile::exists(dir) {
+        bail!(
+            "no profile in {} yet: run `privmsg` to set one up",
+            dir.display()
+        );
+    }
+    let mut tries = 0;
+    loop {
+        let pass = Zeroizing::new(rpassword::prompt_password("Password: ")?);
+        match Node::open(dir, &pass) {
+            Err(e) if e.to_string().contains("wrong passphrase") && tries < 2 => {
+                tries += 1;
+                eprintln!("That password didn't work. Try again.");
+            }
+            result => return result,
+        }
+    }
 }
 
-async fn connect(node: &Node) -> Result<NymTransport> {
-    eprintln!("connecting to the Nym mixnet…");
-    NymTransport::connect(&node.nym_dir()).await
+/// First-run setup: choose a passphrase, create the profile, and on macOS
+/// offer to remember the passphrase in the keychain.
+fn setup(dir: &Path) -> Result<Node> {
+    if let Ok(pass) = std::env::var("PRIVMSG_PASSPHRASE") {
+        if pass.chars().count() < 8 {
+            bail!("PRIVMSG_PASSPHRASE must be at least 8 characters");
+        }
+        return Node::create(dir, &pass);
+    }
+    eprintln!(
+        "Welcome to privmsg!\n\n\
+         Choose a password (at least 8 characters). It locks your messages on\n\
+         this computer. It can't be recovered, so pick one you'll remember.\n"
+    );
+    let pass = loop {
+        let pass = Zeroizing::new(rpassword::prompt_password("Password: ")?);
+        if pass.chars().count() < 8 {
+            eprintln!("Please use at least 8 characters.");
+            continue;
+        }
+        if *pass != *Zeroizing::new(rpassword::prompt_password("Type it again: ")?) {
+            eprintln!("Those didn't match. Let's try again.");
+            continue;
+        }
+        break pass;
+    };
+    let node = Node::create(dir, &pass)?;
+    if cfg!(target_os = "macos")
+        && ask(
+            "\nRemember the password in this Mac's Keychain, so you don't have to type it? [Y/n] ",
+        )?
+    {
+        match keychain::set(dir, &pass) {
+            Ok(()) => eprintln!("Saved. (`privmsg keychain forget` undoes this.)"),
+            Err(e) => eprintln!("Couldn't save it ({e:#}); you'll be asked each time."),
+        }
+    }
+    Ok(node)
+}
+
+/// A yes/no question; Enter alone means yes.
+fn ask(question: &str) -> Result<bool> {
+    eprint!("{question}");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(!answer.trim().to_lowercase().starts_with('n'))
+}
+
+/// Plain `privmsg`: set up on first run, then open the app.
+async fn start(dir: PathBuf) -> Result<()> {
+    let node = if Profile::exists(&dir) {
+        open(&dir)?
+    } else {
+        setup(&dir)?
+    };
+    tui::run(node).await
+}
+
+/// A multiplexer over this profile's Nym addresses, with `slots` online.
+pub(crate) async fn connect(node: &mut Node, slots: &[String]) -> Result<Network> {
+    let mut mux = Mux::new(NymNetwork::new(node.slots_dir()));
+    eprintln!("Connecting securely through the Nym network (about 10 seconds)…");
+    node.connect(&mut mux, slots).await?;
+    Ok(mux)
 }
 
 /// Full content-layer exercise with no network. Proves Layer 1 end to end.
@@ -162,38 +275,72 @@ fn selftest() -> Result<()> {
 }
 
 fn init(dir: PathBuf) -> Result<()> {
-    Node::create(&dir, &passphrase(true)?)?;
+    if Profile::exists(&dir) {
+        bail!("a profile already exists in {}", dir.display());
+    }
+    setup(&dir)?;
     println!("profile created in {}", dir.display());
-    println!("next: `privmsg invite <name>` to invite someone, or `privmsg add <name> <invite>`");
+    println!("next: run `privmsg` to open the app");
     Ok(())
 }
 
-async fn address(dir: PathBuf) -> Result<()> {
+fn address(dir: PathBuf) -> Result<()> {
     let node = open(&dir)?;
-    let transport = connect(&node).await?;
-    println!("{}", transport.address().0);
-    transport.disconnect().await;
+    let show = |a: &str| {
+        if a.is_empty() {
+            "(known after the next connection)".to_string()
+        } else {
+            a.to_string()
+        }
+    };
+    if node.contacts().is_empty() && node.invites().is_empty() {
+        println!("no addresses yet: each contact and invite gets its own");
+    }
+    for c in node.contacts() {
+        println!("{}: {}", clean(&c.name), show(&c.slot.address));
+    }
+    for i in node.invites() {
+        println!("{} (invite): {}", clean(&i.name), show(&i.slot.address));
+    }
     Ok(())
 }
 
-async fn invite(dir: PathBuf, name: &str) -> Result<()> {
+async fn invite(dir: PathBuf, name: &str, qr: bool) -> Result<()> {
     let mut node = open(&dir)?;
-    let transport = connect(&node).await?;
-    let code = node.create_invite(&transport.address(), name)?;
-    transport.disconnect().await;
+    let mut mux = connect(&mut node, &[]).await?;
+    let code = node.create_invite(&mut mux, name).await;
+    mux.close().await;
+    let code = code?;
+    if qr {
+        println!("{}", qr_code(&code)?);
+    }
     println!("{code}");
     eprintln!(
         "\nGive this code to {name} over a channel you trust. It works once.\n\
-         Then run `privmsg listen` (or `chat {name}`) to receive their join."
+         Then run `privmsg listen` (or `ui`) to receive their join."
     );
     Ok(())
 }
 
+/// The invite as a QR code made of Unicode half blocks, light on dark like
+/// `qrencode -t UTF8`; phone cameras read either polarity.
+fn qr_code(text: &str) -> Result<String> {
+    use qrcode::render::unicode::Dense1x2;
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L)
+        .context("invite too long for a QR code")?;
+    Ok(code
+        .render::<Dense1x2>()
+        .dark_color(Dense1x2::Light)
+        .light_color(Dense1x2::Dark)
+        .quiet_zone(true)
+        .build())
+}
+
 async fn add(dir: PathBuf, name: &str, code: &str) -> Result<()> {
     let mut node = open(&dir)?;
-    let mut transport = connect(&node).await?;
-    let result = node.accept_invite(&mut transport, code, name).await;
-    transport.disconnect().await;
+    let mut mux = connect(&mut node, &[]).await?;
+    let result = node.accept_invite(&mut mux, code, name).await;
+    mux.close().await;
     result?;
     println!("{name} added. They will see you as soon as they are online; `privmsg chat {name}` to talk.");
     Ok(())
@@ -205,82 +352,216 @@ fn contacts(dir: PathBuf) -> Result<()> {
         println!("no contacts yet — `privmsg invite <name>` or `privmsg add <name> <invite>`");
     }
     for c in node.contacts() {
-        println!("{}  ({} messages)", c.name, c.history.len());
+        let unread = match c.unread {
+            0 => String::new(),
+            n => format!(", {n} unread"),
+        };
+        println!("{}  ({} messages{unread})", clean(&c.name), c.history.len());
     }
     for i in node.invites() {
-        println!("{}  (invite not used yet)", i.name);
+        println!("{}  (invite not used yet)", clean(&i.name));
     }
     Ok(())
 }
 
 async fn send(dir: PathBuf, name: &str, text: &str) -> Result<()> {
     let mut node = open(&dir)?;
-    node.contact(name)?;
-    let mut transport = connect(&node).await?;
-    let result = node.send_text(&mut transport, name, text).await;
-    transport.disconnect().await;
+    let current = node.slots_for(name)?.swap_remove(0);
+    let mut mux = connect(&mut node, &[current]).await?;
+    let result = async {
+        node.maintain(&mut mux).await?;
+        node.send_text(&mut mux, name, text).await
+    }
+    .await;
+    mux.close().await;
     result?;
     println!("sent.");
     Ok(())
 }
 
-async fn listen(dir: PathBuf, seconds: Option<u64>) -> Result<()> {
+async fn rotate(dir: PathBuf, name: &str) -> Result<()> {
     let mut node = open(&dir)?;
-    let mut transport = connect(&node).await?;
-    eprintln!("listening as {} (Ctrl-C to stop)", transport.address().0);
+    let slots = node.slots_for(name)?;
+    let mut mux = connect(&mut node, &slots).await?;
+    let result = node.rotate(&mut mux, name).await;
+    mux.close().await;
+    result?;
+    println!("{name} now writes to a new address. The old one keeps listening until they confirm.");
+    Ok(())
+}
 
+async fn remove(dir: PathBuf, name: &str) -> Result<()> {
+    let mut node = open(&dir)?;
+    // Removing only deletes local keys; nothing needs to be online.
+    let mut mux = Mux::new(NymNetwork::new(node.slots_dir()));
+    node.remove(&mut mux, name).await?;
+    println!("{name} removed, with its addresses and conversation keys.");
+    Ok(())
+}
+
+fn decoys(dir: PathBuf, setting: Option<&str>) -> Result<()> {
+    let mut node = open(&dir)?;
+    if let Some(setting) = setting {
+        let decoy_interval = match setting {
+            "off" => None,
+            "on" => Some(DEFAULT_DECOY_INTERVAL),
+            secs => match secs.parse::<u32>() {
+                Ok(n) if n >= decoy::MIN_INTERVAL => Some(n),
+                _ => bail!(
+                    "use `on`, `off` or a number of seconds (at least {})",
+                    decoy::MIN_INTERVAL
+                ),
+            },
+        };
+        node.set_settings(Settings { decoy_interval })?;
+    }
+    match node.settings().decoy_interval {
+        None => println!("decoys off: messages go out as soon as you send them"),
+        Some(n) => println!(
+            "decoys on: while connected, each conversation sends a message or a decoy \
+             every ~{n}s at random; your messages wait for the next one"
+        ),
+    }
+    Ok(())
+}
+
+fn keychain_save(dir: PathBuf) -> Result<()> {
+    let pass = match std::env::var("PRIVMSG_PASSPHRASE") {
+        Ok(p) => Zeroizing::new(p),
+        Err(_) => Zeroizing::new(rpassword::prompt_password("Password: ")?),
+    };
+    Node::open(&dir, &pass)?;
+    keychain::set(&dir, &pass)?;
+    println!("passphrase saved in your keychain; privmsg will no longer ask for it.");
+    Ok(())
+}
+
+fn keychain_forget(dir: PathBuf) -> Result<()> {
+    if keychain::delete(&dir)? {
+        println!("passphrase removed from your keychain.");
+    } else {
+        println!("no passphrase for this profile in your keychain.");
+    }
+    Ok(())
+}
+
+/// `listen`, or with `chat_with`, `chat`: receive on every open address,
+/// keep addresses maintained and run decoys if they are on.
+async fn session(dir: PathBuf, chat_with: Option<&str>, seconds: Option<u64>) -> Result<()> {
+    let mut node = open(&dir)?;
+    if let Some(name) = chat_with {
+        let history = &node.contact(name)?.history;
+        for entry in &history[history.len().saturating_sub(10)..] {
+            print_entry(name, entry);
+        }
+        node.mark_read(name)?;
+    }
+    let decoy_interval = node.settings().decoy_interval;
+    // Decoys must cover every conversation, so they need every address.
+    let slots = match chat_with {
+        Some(name) if decoy_interval.is_none() => node.slots_for(name)?,
+        _ => node.all_slots(),
+    };
+    let mut mux = connect(&mut node, &slots).await?;
+    node.maintain(&mut mux).await?;
+    let mut scheduler = decoy_interval.map(|secs| {
+        Scheduler::new(
+            Duration::from_secs(secs.into()),
+            node.contacts().iter().map(|c| c.name.clone()),
+        )
+    });
+    match chat_with {
+        Some(_) => eprintln!("connected — type a message and press Enter; /quit to leave"),
+        None => eprintln!("listening on {} addresses (Ctrl-C to stop)", slots.len()),
+    }
+    if let Some(n) = decoy_interval {
+        eprintln!("decoys on: messages leave at random moments, ~{n}s apart on average");
+    }
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut maintenance =
+        tokio::time::interval_at(Instant::now() + MAINTENANCE_EVERY, MAINTENANCE_EVERY);
     let deadline = tokio::time::sleep(Duration::from_secs(seconds.unwrap_or(u64::MAX / 4)));
     tokio::pin!(deadline);
     let result = loop {
+        let next_tick = scheduler.as_ref().and_then(Scheduler::next_due);
+        let tick_at = next_tick.as_ref().map_or_else(far_future, |(_, at)| *at);
         tokio::select! {
-            msg = transport.recv() => match msg {
-                Ok(msg) => receive(&mut node, &msg.payload),
+            msg = mux.recv() => match msg {
+                Ok((slot, msg)) => {
+                    receive(&mut node, &mut mux, &slot, &msg.payload, scheduler.as_mut()).await
+                }
                 Err(e) => break Err(e),
             },
-            _ = &mut deadline => break Ok(()),
-            _ = tokio::signal::ctrl_c() => break Ok(()),
-        }
-    };
-    transport.disconnect().await;
-    result
-}
-
-async fn chat(dir: PathBuf, name: &str) -> Result<()> {
-    let mut node = open(&dir)?;
-    let history = &node.contact(name)?.history;
-    for entry in &history[history.len().saturating_sub(10)..] {
-        print_entry(name, entry);
-    }
-    let mut transport = connect(&node).await?;
-    eprintln!("connected — type a message and press Enter; /quit to leave");
-
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let result = loop {
-        tokio::select! {
-            msg = transport.recv() => match msg {
-                Ok(msg) => receive(&mut node, &msg.payload),
-                Err(e) => break Err(e),
-            },
-            line = lines.next_line() => match line {
+            line = lines.next_line(), if chat_with.is_some() => match line {
                 Ok(Some(line)) if line.trim() == "/quit" => break Ok(()),
                 Ok(Some(line)) if line.trim().is_empty() => {}
                 Ok(Some(line)) => {
-                    if let Err(e) = node.send_text(&mut transport, name, &line).await {
-                        eprintln!("! not sent: {e:#}");
+                    let name = chat_with.expect("chat mode");
+                    match scheduler.as_mut() {
+                        Some(s) => s.queue(name, line),
+                        None => {
+                            if let Err(e) = node.send_text(&mut mux, name, &line).await {
+                                eprintln!("! not sent: {e:#}");
+                            }
+                        }
                     }
                 }
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e.into()),
             },
+            _ = tokio::time::sleep_until(tick_at), if next_tick.is_some() => {
+                let (name, _) = next_tick.expect("tick scheduled");
+                let s = scheduler.as_mut().expect("decoys on");
+                tick(&mut node, &mut mux, s, &name).await;
+            }
+            _ = maintenance.tick() => {
+                if let Err(e) = node.maintain(&mut mux).await {
+                    tracing::warn!("address maintenance failed: {e:#}");
+                }
+            }
+            _ = &mut deadline => break Ok(()),
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }
     };
-    transport.disconnect().await;
+    if let Some(s) = scheduler.as_mut() {
+        flush_queued(&mut node, &mut mux, s).await;
+    }
+    mux.close().await;
     result
 }
 
+/// One decoy-clock tick for `name`: their oldest queued message, or a decoy.
+pub(crate) async fn tick(node: &mut Node, mux: &mut Network, s: &mut Scheduler, name: &str) {
+    match s.tick(name) {
+        Some(text) => {
+            if let Err(e) = node.send_text(mux, name, &text).await {
+                eprintln!("! not sent to {}: {e:#}", clean(name));
+            }
+        }
+        None => {
+            if let Err(e) = node.send_decoy(mux, name).await {
+                tracing::warn!("decoy to {name} not sent: {e:#}");
+            }
+        }
+    }
+}
+
+/// Send what the decoy clock had not got to yet, so quitting loses nothing.
+pub(crate) async fn flush_queued(node: &mut Node, mux: &mut Network, s: &mut Scheduler) {
+    for (name, text) in s.drain() {
+        if let Err(e) = node.send_text(mux, &name, &text).await {
+            eprintln!("! not sent to {}: {e:#}", clean(&name));
+        }
+    }
+}
+
+pub(crate) fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(86_400 * 365)
+}
+
 fn history(dir: PathBuf, name: &str) -> Result<()> {
-    let node = open(&dir)?;
+    let mut node = open(&dir)?;
     let contact = node.contact(name)?;
     if contact.history.is_empty() {
         println!("no messages with {name} yet");
@@ -288,19 +569,32 @@ fn history(dir: PathBuf, name: &str) -> Result<()> {
     for entry in &contact.history {
         print_entry(name, entry);
     }
-    Ok(())
+    node.mark_read(name)
 }
 
-fn receive(node: &mut Node, payload: &[u8]) {
-    match node.handle_incoming(payload) {
+async fn receive(
+    node: &mut Node,
+    mux: &mut Network,
+    slot: &str,
+    payload: &[u8],
+    scheduler: Option<&mut Scheduler>,
+) {
+    match node.handle_incoming(mux, slot, payload).await {
         Ok(events) => {
+            let mut scheduler = scheduler;
             for event in events {
                 match event {
                     Event::Joined { contact } => {
-                        println!("* {} accepted your invite", clean(&contact))
+                        println!("* {} accepted your invite", clean(&contact));
+                        if let Some(s) = scheduler.as_deref_mut() {
+                            s.add(contact);
+                        }
                     }
                     Event::Message { contact, text } => {
-                        println!("{}: {}", clean(&contact), clean(&text))
+                        println!("{}: {}", clean(&contact), clean(&text));
+                        if let Err(e) = node.mark_read(&contact) {
+                            tracing::warn!("{e:#}");
+                        }
                     }
                 }
             }
@@ -309,21 +603,29 @@ fn receive(node: &mut Node, payload: &[u8]) {
     }
 }
 
-fn print_entry(name: &str, entry: &store::HistoryEntry) {
+fn print_entry(name: &str, entry: &HistoryEntry) {
     let who = if entry.outgoing { "me" } else { name };
     println!("[{}] {}: {}", utc(entry.at), clean(who), clean(&entry.text));
 }
 
 /// Strip control characters so a contact can't send terminal escape
-/// sequences that rewrite the screen.
-fn clean(text: &str) -> String {
+/// sequences that rewrite the screen, and bidirectional overrides that make
+/// text display in a different order than it was written.
+pub(crate) fn clean(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| {
+            let bidi = matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+            if c.is_control() || bidi {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
 /// `YYYY-MM-DD HH:MM` in UTC (days-from-civil, Howard Hinnant's algorithm).
-fn utc(unix: u64) -> String {
+pub(crate) fn utc(unix: u64) -> String {
     let (days, secs) = ((unix / 86_400) as i64, unix % 86_400);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -356,6 +658,19 @@ mod tests {
     fn control_characters_are_neutralised() {
         assert_eq!(clean("hi\x1b[2Jthere\n"), "hi\u{FFFD}[2Jthere\u{FFFD}");
         assert_eq!(clean("ünïcödé ok"), "ünïcödé ok");
+        assert_eq!(clean("abc\u{202E}fed"), "abc\u{FFFD}fed", "bidi override");
+    }
+
+    #[test]
+    fn invite_qr_code_renders() -> Result<()> {
+        let code = format!("privmsg1:{}", "A".repeat(700));
+        let qr = qr_code(&code)?;
+        assert!(qr.lines().count() > 20);
+        assert!(
+            qr_code(&"A".repeat(5000)).is_err(),
+            "too long for any QR version"
+        );
+        Ok(())
     }
 
     #[test]

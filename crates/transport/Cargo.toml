@@ -10,4 +10,10 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-nym-sdk = { workspace = true }
+nym-sdk = { workspace = true, optional = true }
+
+[features]
+# The real mixnet. Off only for the fuzz targets, which use the in-memory
+# network and don't need to build (or link) the Nym tree.
+default = ["nym"]
+nym = ["dep:nym-sdk"]
