@@ -1,0 +1,12 @@
+[package]
+name = "privmsg-transport"
+version = "0.1.0"
+edition = "2021"
+description = "Layer 2: metadata-private transport over the Nym mixnet (Sphinx + cover traffic)."
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+nym-sdk = { workspace = true }

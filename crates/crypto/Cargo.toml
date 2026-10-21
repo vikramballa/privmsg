@@ -1,0 +1,15 @@
+[package]
+name = "privmsg-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "Layer 1: content end-to-end encryption via MLS (OpenMLS, RFC 9420)."
+
+[dependencies]
+openmls = { workspace = true }
+openmls_rust_crypto = { workspace = true }
+openmls_basic_credential = { workspace = true }
+openmls_traits = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }

@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+
+# Cargo.lock is committed on purpose: this is an application, and the lock
+# pins the Nym crate set that compiles together (see Cargo.toml).
+
+# privmsg profiles — never commit keys or message history, even encrypted.
+# (Profiles live in ~/.privmsg by default; these catch --data-dir inside the repo.)
+.privmsg/
+state.enc
+state.enc.tmp
+/**/lock
+# Nym client keys, gateway registration and credential databases
+nym/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Fuzzing artefacts (cargo-fuzz)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/

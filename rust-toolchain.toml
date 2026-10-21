@@ -1,0 +1,5 @@
+# Pinned toolchain so every build uses the same compiler: reproducible builds
+# are a security property here (docs/ARCHITECTURE.md §6).
+[toolchain]
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]
