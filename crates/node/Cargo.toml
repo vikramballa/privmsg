@@ -2,6 +2,7 @@
 name = "privmsg-node"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 description = "Phase 1 node: runs MLS-encrypted messages over the Nym mixnet, end to end."
 
 [[bin]]

@@ -74,7 +74,7 @@ and the encryption layer never sees an IP address. The full design is in
 `rustup` (the right compiler version is picked automatically).
 
 ```bash
-git clone https://github.com/<vikramballa >/privmsg.git
+git clone https://github.com/vikramballa/privmsg.git
 cd privmsg
 cargo build --release
 ```
@@ -297,5 +297,4 @@ working set. See the note in `Cargo.toml`.
 
 ## License
 
-Not chosen yet. Until a license is added, all rights are reserved by the
-author.
+Licensed under the [Apache License, Version 2.0](LICENSE).
