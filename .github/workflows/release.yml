@@ -26,6 +26,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,13 +43,22 @@ jobs:
         run: |
           name="privmsg-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/privmsg" README.md LICENSE "$name/"
-          tar czf "$name.tar.gz" "$name"
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          cp README.md LICENSE "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/${{ matrix.target }}/release/privmsg.exe" "$name/"
+            7z a "$name.zip" "$name"
+            sha256sum "$name.zip" > "$name.zip.sha256"
+          else
+            cp "target/${{ matrix.target }}/release/privmsg" "$name/"
+            tar czf "$name.tar.gz" "$name"
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: privmsg-*.tar.gz*
+          path: |
+            privmsg-*.tar.gz*
+            privmsg-*.zip*
 
   publish:
     needs: build
@@ -60,4 +71,6 @@ jobs:
         with:
           prerelease: true
           generate_release_notes: true
-          files: privmsg-*.tar.gz*
+          files: |
+            privmsg-*.tar.gz*
+            privmsg-*.zip*

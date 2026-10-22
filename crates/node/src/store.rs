@@ -22,7 +22,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -309,11 +308,10 @@ impl Profile {
             .map_err(|_| anyhow!("encrypt state"))?;
 
         let tmp = self.dir.join(format!("{STATE_FILE}.tmp"));
-        let mut file = OpenOptions::new()
+        let mut file = private_file()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(&tmp)
             .with_context(|| format!("write {}", tmp.display()))?;
         file.write_all(&header)?;
@@ -322,7 +320,8 @@ impl Profile {
         // Fuzzing saves on every input; durability is irrelevant there.
         #[cfg(not(fuzzing))]
         file.sync_all()?;
-        fs::rename(&tmp, self.dir.join(STATE_FILE)).context("replace state file")?;
+        drop(file);
+        replace(&tmp, &self.dir.join(STATE_FILE)).context("replace state file")?;
         Ok(())
     }
 
@@ -337,11 +336,33 @@ impl Profile {
 }
 
 fn create_private_dir(dir: &Path) -> Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("create {}", dir.display()))
+    privmsg_transport::create_private_dir(dir).with_context(|| format!("create {}", dir.display()))
+}
+
+/// Options for a file only its owner can open. On Windows the profile
+/// folder's access list (see [`create_private_dir`]) already ensures that.
+fn private_file() -> OpenOptions {
+    #[allow(unused_mut)]
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+}
+
+/// Atomically move `from` over `to`.
+fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    // On Windows a virus scanner or search indexer that just opened the
+    // fresh file can make the rename fail for a moment; try a few times.
+    #[cfg(windows)]
+    for _ in 0..10 {
+        match fs::rename(from, to) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            done => return done,
+        }
+    }
+    fs::rename(from, to)
 }
 
 fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
@@ -353,11 +374,10 @@ fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
 }
 
 fn lock(dir: &Path) -> Result<File> {
-    let file = OpenOptions::new()
+    let file = private_file()
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
         .open(dir.join(LOCK_FILE))
         .context("open profile lock")?;
     file.try_lock().map_err(|_| {

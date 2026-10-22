@@ -28,6 +28,19 @@ qrcode = { version = "0.14", default-features = false }
 # --- macOS keychain (already in the tree via Nym's TLS stack) ---
 security-framework = "2.11"
 
+# --- Windows: private folders and a clipboard that skips history/cloud sync
+# (0.59 is already in the tree via tokio and friends) ---
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+] }
+
 # --- At-rest encryption of the local profile ---
 argon2 = "0.5"
 chacha20poly1305 = "0.10"

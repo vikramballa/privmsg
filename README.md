@@ -73,7 +73,13 @@ and the encryption layer never sees an IP address. The full design is in
 
 ## Install
 
-You need a Mac or a Linux computer.
+Works on **Mac**, **Linux** (including Parrot, Kali, Ubuntu, Debian) and
+**Windows 10/11**.
+
+### Mac and Linux
+
+On Linux, first install the build tools:
+`sudo apt install -y build-essential git curl xclip` (Debian, Ubuntu, Parrot).
 
 **1. Install Rust** (one time). Open Terminal and run the command shown at
 [rustup.rs](https://rustup.rs), then open a new Terminal window.
@@ -88,6 +94,28 @@ cd privmsg
 
 The first build takes a few minutes. After that you can open privmsg from
 any Terminal window by typing `privmsg`.
+
+### Windows
+
+**1. Install Rust** (one time). Download `rustup-init.exe` from
+[rustup.rs](https://rustup.rs), run it, and accept the defaults. When it
+offers to install the Visual Studio build tools, say yes. Also install
+[Git for Windows](https://git-scm.com/download/win).
+
+**2. Download and install privmsg.** Open **PowerShell** (Start menu → type
+"PowerShell") and run:
+
+```powershell
+git clone https://github.com/vikramballa/privmsg.git
+cd privmsg
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+**3.** Open a **new** PowerShell window and type `privmsg`.
+
+Use **Windows Terminal** (built into Windows 11; free in the Microsoft
+Store for Windows 10) for the best-looking app. To paste an invite code
+there, press **Ctrl-O** in privmsg and then **Ctrl-V** (or right-click).
 
 *(Ready-made downloads will appear on the
 [Releases page](https://github.com/vikramballa/privmsg/releases) once a
@@ -111,7 +139,8 @@ to type it again.
 **2. Invite a friend:** press **Ctrl-N**, type a name for them (only you
 see it), and press **Enter**. Your invite code is shown and **copied to
 your clipboard**. Paste it to your friend any way you like (WhatsApp,
-Signal, email, a text). Each code works **once**.
+Signal, email, a text). Each code works **once**. On Windows the code
+is kept out of Clipboard History and cloud clipboard sync.
 
 **3. Your friend enters it:** in their privmsg they press **Ctrl-O**, paste
 the code, press **Enter**, then type a name for you and press **Enter**.
@@ -167,7 +196,7 @@ users on your computer, connects them, and opens a chat window for each.
 | | |
 |---|---|
 | `--data-dir <dir>` | Use a different profile folder (handy for running two profiles on one machine) |
-| `PRIVMSG_HOME` | Default profile folder (otherwise `~/.privmsg`) |
+| `PRIVMSG_HOME` | Default profile folder (otherwise `~/.privmsg`, or `%LOCALAPPDATA%\privmsg` on Windows) |
 | `PRIVMSG_PASSPHRASE` | Supply the passphrase non-interactively, for scripts. ⚠️ Avoid on shared machines |
 | `RUST_LOG` | Log detail, e.g. `RUST_LOG=debug`. In the app, logs go to `privmsg.log` in the profile folder |
 
@@ -175,12 +204,15 @@ users on your computer, connects them, and opens a chat window for each.
 
 ## Where your data lives
 
-Everything is in your profile folder (default `~/.privmsg`):
+Everything is in your profile folder: `~/.privmsg` on Mac and Linux,
+`%LOCALAPPDATA%\privmsg` on Windows (that is,
+`C:\Users\<you>\AppData\Local\privmsg`, which Windows doesn't sync to
+other PCs and OneDrive doesn't back up):
 
 | File | Contents | Protected? |
 |---|---|---|
 | `state.enc` | Your keys, contacts, conversations, message history | ✅ Encrypted with your passphrase (Argon2id + XChaCha20-Poly1305) |
-| `slots/` | One folder of Nym network keys per address (one per contact and per open invite) | ⚠️ Not encrypted by privmsg (only by folder permissions) |
+| `slots/` | One folder of Nym network keys per address (one per contact and per open invite) | ⚠️ Not encrypted by privmsg, only by folder permissions: only your user account can open the profile folder (mode 0700 on Mac and Linux; on Windows an access list with your account as the only entry) |
 | `lock` | Stops two copies of privmsg using the same profile | — |
 
 🔑 **There is no password recovery.** If you forget your passphrase, your
@@ -261,6 +293,8 @@ contacts means more background traffic. That's expected.
 | `… has not confirmed the last address change yet` | Your contact hasn't been online since your last rotation. It completes by itself; try `rotate` again later. |
 | `message is … bytes; the limit is 16384` | Split long text into several messages. |
 | Asked for a passphrase although you used `keychain save` | The keychain entry is tied to the profile folder's path. Run `keychain save` again for that folder. |
+| Windows: `'privmsg' is not recognized` | Open a **new** PowerShell window after installing, so it picks up the updated PATH. |
+| Windows: the invite wasn't copied | Select the code with the mouse and press **Ctrl-Shift-C** in Windows Terminal (or **Enter** in the old console window). |
 | Messages are slow | Normal mixnet delay. If nothing arrives, check your internet connection and that both sides are running a recent build. |
 
 ---
@@ -284,7 +318,8 @@ contacts means more background traffic. That's expected.
 - [x] **Usability**
   - [x] Full-screen terminal UI (contact list, unread counts)
   - [x] QR-code invites
-  - [x] Prebuilt releases for macOS and Linux (GitHub Actions, on version tags)
+  - [x] Prebuilt releases for macOS, Linux and Windows (GitHub Actions, on version tags)
+  - [x] Native Windows support
 - [x] **Phase 3: stronger metadata privacy**
   - [x] Decoy-traffic scheduler (Loopix-style constant-rate sending; no
         formal differential-privacy guarantee)

@@ -1,6 +1,5 @@
 //! The real transport: Nym mixnet clients, one per slot.
 
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -65,10 +64,7 @@ impl NymTransport {
     /// in the SDK. Do NOT disable them — they are the anonymity, not overhead
     /// to trim.
     pub async fn connect(storage_dir: &Path) -> Result<Self> {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(storage_dir)
+        crate::create_private_dir(storage_dir)
             .with_context(|| format!("create {}", storage_dir.display()))?;
         let paths = StoragePaths::new_from_dir(storage_dir)?;
         let client = MixnetClientBuilder::new_with_default_storage(paths)

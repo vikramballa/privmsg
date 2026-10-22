@@ -7,8 +7,6 @@
 //! invite to the clipboard; Ctrl-O takes a pasted invite code and asks what
 //! to call its sender. (`/invite <name>` and `/add <name> <code>` still work.)
 
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -213,7 +211,10 @@ async fn event_loop(
             }
             key = keys.next() => match key {
                 Some(Ok(TermEvent::Key(k))) if k.kind == KeyEventKind::Press => {
-                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    // Windows reports AltGr (how many keyboards type @, € or
+                    // {) as Ctrl+Alt; that is typing, not a shortcut.
+                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(KeyModifiers::ALT);
                     match app.key(k.code, ctrl) {
                         Action::None => {}
                         Action::Quit => return Ok(()),
@@ -335,7 +336,11 @@ async fn add(
 }
 
 /// Put `text` on the system clipboard, if there is a clipboard tool.
+#[cfg(not(windows))]
 fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
     let tools: &[&[&str]] = &[
         &["pbcopy"],
         &["wl-copy"],
@@ -359,6 +364,88 @@ fn copy_to_clipboard(text: &str) -> bool {
             })
             .is_ok_and(|status| status.success())
     })
+}
+
+/// Put `text` on the Windows clipboard, kept out of Clipboard History and
+/// cloud clipboard sync: an invite code is a one-time key to becoming the
+/// contact, so it must not be uploaded or linger after it's been pasted.
+#[cfg(windows)]
+fn copy_to_clipboard(text: &str) -> bool {
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+    use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+
+    /// Hand `bytes` to the open clipboard under `format`.
+    unsafe fn put(format: u32, bytes: &[u8]) -> bool {
+        let mem = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+        if mem.is_null() {
+            return false;
+        }
+        let dst = GlobalLock(mem);
+        if dst.is_null() {
+            GlobalFree(mem);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.cast(), bytes.len());
+        GlobalUnlock(mem);
+        // On success the clipboard owns `mem`.
+        if SetClipboardData(format, mem).is_null() {
+            GlobalFree(mem);
+            return false;
+        }
+        true
+    }
+
+    fn format(name: &str) -> u32 {
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: NUL-terminated UTF-16.
+        unsafe { RegisterClipboardFormatW(wide.as_ptr()) }
+    }
+
+    let utf16: Vec<u8> = text
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    // Microsoft's documented opt-outs: a DWORD 0 under each of these
+    // formats keeps the text out of history and cloud sync, and the
+    // last one asks clipboard monitors to skip it.
+    let opt_outs = [
+        ("CanIncludeInClipboardHistory", &0u32.to_le_bytes()[..]),
+        ("CanUploadToCloudClipboard", &0u32.to_le_bytes()[..]),
+        ("ExcludeClipboardContentFromMonitorProcessing", &[0u8][..]),
+    ];
+
+    // SAFETY: the clipboard is opened once and always closed again; every
+    // pointer passed is valid for the call.
+    unsafe {
+        // Another program may be holding the clipboard for a moment.
+        let mut tries = 0;
+        while OpenClipboard(std::ptr::null_mut()) == 0 {
+            tries += 1;
+            if tries == 10 {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ok = EmptyClipboard() != 0
+            && opt_outs.iter().all(|(name, data)| {
+                let f = format(name);
+                f != 0 && put(f, data)
+            })
+            && put(CF_UNICODETEXT as u32, &utf16);
+        if !ok {
+            // Never leave the code on the clipboard without its opt-outs.
+            EmptyClipboard();
+        }
+        CloseClipboard();
+        ok
+    }
 }
 
 fn select(node: &Node, app: &mut App, name: &str) {

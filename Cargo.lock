@@ -6011,6 +6011,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 
@@ -6021,8 +6022,10 @@ dependencies = [
  "anyhow",
  "futures",
  "nym-sdk",
+ "tempfile",
  "tokio",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

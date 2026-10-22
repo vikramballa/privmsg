@@ -60,7 +60,8 @@ commands:
   selftest                offline check of the encryption layer
 
 environment:
-  PRIVMSG_HOME            profile directory (default ~/.privmsg)
+  PRIVMSG_HOME            profile directory (default ~/.privmsg,
+                          or %LOCALAPPDATA%\\privmsg on Windows)
   PRIVMSG_PASSPHRASE      passphrase for scripts (avoid on shared machines)
   RUST_LOG                log filter (default: warn)";
 
@@ -146,9 +147,24 @@ fn take_data_dir(args: &mut Vec<String>) -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("PRIVMSG_HOME") {
         return Ok(PathBuf::from(dir));
     }
+    default_data_dir()
+}
+
+#[cfg(not(windows))]
+fn default_data_dir() -> Result<PathBuf> {
     let home =
         std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set; use --data-dir"))?;
     Ok(PathBuf::from(home).join(".privmsg"))
+}
+
+/// `%LOCALAPPDATA%\privmsg`: Local, not Roaming, so the profile never
+/// follows the user to other machines, and outside the folders OneDrive
+/// backs up.
+#[cfg(windows)]
+fn default_data_dir() -> Result<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| anyhow!("LOCALAPPDATA is not set; use --data-dir"))?;
+    Ok(PathBuf::from(local).join("privmsg"))
 }
 
 /// The passphrase from `PRIVMSG_PASSPHRASE` or the keychain, if either
