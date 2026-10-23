@@ -31,6 +31,7 @@ both:
 - [Commands](#commands)
 - [Where your data lives](#where-your-data-lives)
 - [Addresses, rotation and decoys](#addresses-rotation-and-decoys)
+- [Internet data and Tor](#internet-data-and-tor)
 - [What it protects (and what it doesn't)](#what-it-protects-and-what-it-doesnt)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
@@ -56,7 +57,13 @@ both:
      │
      ▼
  ┌────────────────────────────┐
- │ 3. Nym mixnet              │  layered encryption, several hops,
+ │ 3. Tor                     │  hides your IP address from the
+ │                            │  Nym servers (on by default)
+ └────────────────────────────┘
+     │
+     ▼
+ ┌────────────────────────────┐
+ │ 4. Nym mixnet              │  layered encryption, several hops,
  │    (Sphinx packets +       │  random delays, constant fake traffic
  │     cover traffic)         │  → nobody sees both ends
  └────────────────────────────┘
@@ -76,7 +83,48 @@ and the encryption layer never sees an IP address. The full design is in
 Works on **Mac**, **Linux** (including Parrot, Kali, Ubuntu, Debian) and
 **Windows 10/11**.
 
-### Mac and Linux
+### Easiest: the ready-made download (about 20 MB)
+
+Go to the [Releases page](https://github.com/vikramballa/privmsg/releases)
+and download the file for your computer. It contains privmsg and the Tor
+program it uses to hide your IP address; keep the two together.
+
+| Your computer | File to download |
+|---|---|
+| Mac with Apple chip (M1, M2, M3…) | `…-aarch64-apple-darwin.tar.gz` |
+| Mac with Intel chip | `…-x86_64-apple-darwin.tar.gz` |
+| Windows 10/11 | `…-x86_64-pc-windows-msvc.zip` |
+| Linux (normal PC) | `…-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux on ARM (e.g. Raspberry Pi) | `…-aarch64-unknown-linux-gnu.tar.gz`, plus `sudo apt install tor` |
+
+(Not sure which Mac? Apple menu → **About This Mac** → "Chip".)
+
+**Mac:** double-click the download to unpack it, open **Terminal**, and
+paste (use the folder name you got):
+
+```bash
+cd ~/Downloads/privmsg-v0.2.0-aarch64-apple-darwin
+xattr -dr com.apple.quarantine .
+./privmsg
+```
+
+The middle line tells macOS you trust this download, so it doesn't block
+privmsg or Tor.
+
+**Windows:** right-click the `.zip` → **Extract All**. Open the extracted
+folder, click the address bar, type `powershell`, press Enter, then type
+`.\privmsg.exe` and press Enter. If a blue "Windows protected your PC"
+box appears, click **More info → Run anyway**.
+
+**Linux:** `tar xzf privmsg-*.tar.gz`, `cd` into the folder, `./privmsg`.
+
+Nothing else to install. Space used: about 20 MB for the download, about
+45 MB unpacked, and under 1 MB for your messages.
+
+### Build it yourself: Mac and Linux
+
+This needs Rust, which takes a few GB of disk space while building. Most
+people should use the download above.
 
 On Linux, first install the build tools:
 `sudo apt install -y build-essential git curl xclip` (Debian, Ubuntu, Parrot).
@@ -95,7 +143,7 @@ cd privmsg
 The first build takes a few minutes. After that you can open privmsg from
 any Terminal window by typing `privmsg`.
 
-### Windows
+### Build it yourself: Windows
 
 **1. Install Rust** (one time). Download `rustup-init.exe` from
 [rustup.rs](https://rustup.rs), run it, and accept the defaults. When it
@@ -117,9 +165,8 @@ Use **Windows Terminal** (built into Windows 11; free in the Microsoft
 Store for Windows 10) for the best-looking app. To paste an invite code
 there, press **Ctrl-O** in privmsg and then **Ctrl-V** (or right-click).
 
-*(Ready-made downloads will appear on the
-[Releases page](https://github.com/vikramballa/privmsg/releases) once a
-version is published.)*
+Both install scripts also download Tor (checked against a pinned SHA-256)
+and put it next to privmsg.
 
 ---
 
@@ -188,6 +235,8 @@ users on your computer, connects them, and opens a chat window for each.
 | `privmsg remove <name>` | Forget a contact or unused invite, with its addresses and keys |
 | `privmsg address` | Show your mix address for each contact |
 | `privmsg decoys [on\|off\|<seconds>]` | Show or set decoy traffic (see below) |
+| `privmsg data [saver\|balanced\|maximum]` | Show or set how much internet data privmsg uses (see below) |
+| `privmsg tor [on\|off]` | Show or set hiding your IP address with Tor (on by default) |
 | `privmsg keychain save` / `forget` | Keep the passphrase in the macOS keychain so privmsg stops asking, or remove it |
 | `privmsg selftest` | Offline check of the encryption layer |
 
@@ -198,6 +247,7 @@ users on your computer, connects them, and opens a chat window for each.
 | `--data-dir <dir>` | Use a different profile folder (handy for running two profiles on one machine) |
 | `PRIVMSG_HOME` | Default profile folder (otherwise `~/.privmsg`, or `%LOCALAPPDATA%\privmsg` on Windows) |
 | `PRIVMSG_PASSPHRASE` | Supply the passphrase non-interactively, for scripts. ⚠️ Avoid on shared machines |
+| `PRIVMSG_TOR` | Path to the `tor` program to use (otherwise `tor/` next to privmsg, then your PATH) |
 | `RUST_LOG` | Log detail, e.g. `RUST_LOG=debug`. In the app, logs go to `privmsg.log` in the profile folder |
 
 ---
@@ -213,6 +263,7 @@ other PCs and OneDrive doesn't back up):
 |---|---|---|
 | `state.enc` | Your keys, contacts, conversations, message history | ✅ Encrypted with your passphrase (Argon2id + XChaCha20-Poly1305) |
 | `slots/` | One folder of Nym network keys per address (one per contact and per open invite) | ⚠️ Not encrypted by privmsg, only by folder permissions: only your user account can open the profile folder (mode 0700 on Mac and Linux; on Windows an access list with your account as the only entry) |
+| `tor/` | Tor's directory cache and entry guards, so later starts are quick | Folder permissions, like `slots/` |
 | `lock` | Stops two copies of privmsg using the same profile | — |
 
 🔑 **There is no password recovery.** If you forget your passphrase, your
@@ -250,13 +301,50 @@ contacts means more background traffic. That's expected.
 
 ---
 
+## Internet data and Tor
+
+**Data modes.** To hide when you're really chatting, privmsg keeps sending
+fake packets while it's open, and your real messages blend into that
+stream. How thick the stream is decides how much data privmsg uses:
+
+| Mode | Data per contact, per hour open | A message takes | |
+|---|---|---|---|
+| `saver` (default) | about **8 MB** | ~7 seconds | good cover |
+| `balanced` | about **32 MB** | ~2 seconds | more cover |
+| `maximum` | about **860 MB** | instant | Nym's own default, built for a VPN |
+
+Measured on the live Nym network (October 2026). Change it with
+`privmsg data balanced` (it applies the next time privmsg connects).
+**When privmsg is closed it uses no data at all.** Every mode keeps the
+fake-packet stream running, so sending a message never makes a burst
+someone could spot; only the stream's speed changes.
+
+**Tor (on by default).** Without it, the first Nym server you connect to
+can see your IP address (not your messages, and not who you talk to). With
+Tor, privmsg reaches Nym through three Tor relays first, so the Nym servers
+only see a Tor address, your internet provider only sees that you use Tor,
+and each of your addresses goes through its own Tor circuit. No VPN needed.
+
+It costs a slower first start (Tor connects in 10–30 seconds; later starts
+are faster), a few MB a day for Tor to stay up to date while privmsg is
+open, and about 9 MB of disk. If Tor can't start, privmsg refuses to
+connect rather than quietly going without it. `privmsg tor off` turns it
+off.
+
+Where Tor itself is blocked (for example China, Iran or Russia), it needs
+"bridges", which privmsg doesn't set up yet.
+
+---
+
 ## What it protects (and what it doesn't)
 
 **Protected ✅**
 - **Message content:** end-to-end encrypted, with forward secrecy (old
   messages stay safe if keys leak later) and post-compromise security.
 - **Tampering:** forged, modified or replayed messages are rejected.
-- **Who talks to whom, and your IP address:** hidden by the mixnet.
+- **Who talks to whom:** hidden by the mixnet.
+- **Your IP address:** the mixnet hides it from your contacts, and Tor hides
+  it from the Nym servers.
 - **Message length:** messages are padded to fixed-size blocks.
 - **Identity:** no accounts or phone numbers. Contact nicknames never leave
   your device, and invite codes work only once.
@@ -267,9 +355,12 @@ contacts means more background traffic. That's expected.
 - **When you write:** with decoys on, real messages are hidden among decoys.
 
 **Not protected ⚠️**
-- **Gateways working together:** all your addresses connect from the same
-  IP address. Each gateway sees your IP, so gateway operators who pooled
-  their logs could link your addresses.
+- **Gateways working together (with Tor off):** all your addresses then
+  connect from the same IP address, so gateway operators who pooled their
+  logs could link them. With Tor on, each address arrives through its own
+  Tor circuit instead.
+- **Countries that block Tor:** Tor needs bridges there, which privmsg
+  doesn't support yet. Use `privmsg tor off` (and ideally a VPN) meanwhile.
 - **Long-term traffic analysis by a very powerful observer:** cover traffic
   and decoys help a lot, but there's no formal guarantee. Being online at
   all is still visible.
@@ -295,7 +386,10 @@ contacts means more background traffic. That's expected.
 | Asked for a passphrase although you used `keychain save` | The keychain entry is tied to the profile folder's path. Run `keychain save` again for that folder. |
 | Windows: `'privmsg' is not recognized` | Open a **new** PowerShell window after installing, so it picks up the updated PATH. |
 | Windows: the invite wasn't copied | Select the code with the mouse and press **Ctrl-Shift-C** in Windows Terminal (or **Enter** in the old console window). |
-| Messages are slow | Normal mixnet delay. If nothing arrives, check your internet connection and that both sides are running a recent build. |
+| Messages are slow | Normal mixnet delay (a few seconds in `saver` mode). If nothing arrives, check your internet connection and that both sides are running a recent build. |
+| `Tor was not found` | Keep the `tor` folder from the download next to privmsg, or install Tor (`brew install tor`, `sudo apt install tor`). |
+| `Tor could not connect within 3 minutes` | Check your internet. If Tor is blocked where you are, use `privmsg tor off` for now. |
+| Mac: `"tor" can't be opened` or privmsg is "killed" | Run `xattr -dr com.apple.quarantine .` inside the privmsg folder. |
 
 ---
 
@@ -323,6 +417,12 @@ contacts means more background traffic. That's expected.
 - [x] **Phase 3: stronger metadata privacy**
   - [x] Decoy-traffic scheduler (Loopix-style constant-rate sending; no
         formal differential-privacy guarantee)
+- [x] **Lighter and more private**
+  - [x] Data modes: about 8 MB an hour per contact by default instead of 860
+  - [x] Tor in front of Nym, so the Nym servers never see your IP (bundled)
+  - [ ] Tor bridges for countries that block Tor
+  - [ ] One shared connection for all contacts (less data with many contacts)
+  - [ ] "Lite" mode over Tor onion services only
 
 Ideas and bug reports are welcome. Please open an issue.
 
@@ -338,6 +438,8 @@ crates/
   transport/   Layer 2: Nym clients per slot, multiplexer, padding, test network
   node/        The privmsg app: profile, wire format, invites, rotation,
                decoys (library), plus the CLI and terminal UI (binary)
+vendor/        nym-gateway-client with one patch: connect through Tor
+scripts/       install scripts; fetch-tor.sh (pinned, checksummed Tor)
 fuzz/          cargo-fuzz targets for everything read from the network
 docs/
   ARCHITECTURE.md   Design, wire format, threat model
@@ -347,7 +449,7 @@ docs/
 **Build and test**
 
 ```bash
-cargo test --workspace          # 60 tests, no network needed
+cargo test --workspace          # 63 tests, no network needed
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
@@ -366,7 +468,8 @@ is exactly what that fuzzer produces. The targets build without the `nym`
 feature, so they don't compile the Nym tree at all.
 
 **Releases:** pushing a tag like `v0.2.0` makes GitHub Actions build and
-publish macOS and Linux binaries as a pre-release.
+publish macOS, Linux and Windows downloads, each with Tor, as a
+pre-release.
 
 The Rust version is pinned in `rust-toolchain.toml` so everyone builds with
 the same compiler.

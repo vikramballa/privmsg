@@ -8,19 +8,34 @@ use futures::StreamExt;
 use nym_sdk::mixnet::{
     IncludedSurbs, MixnetClient, MixnetClientBuilder, MixnetMessageSender, Recipient, StoragePaths,
 };
+use nym_sdk::DebugConfig;
 use tokio::time::{sleep, Instant};
 
-use crate::{pad, unpad, IncomingMessage, MixAddress, Network, Transport};
+use crate::{pad, unpad, DataMode, IncomingMessage, MixAddress, Network, Tor, Transport};
 
 /// The Nym mainnet. Each slot keeps its client keys and gateway registration
 /// in its own directory under `root`, so its address survives restarts.
 pub struct NymNetwork {
     root: PathBuf,
+    mode: DataMode,
+    tor: Option<Tor>,
 }
 
 impl NymNetwork {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    pub fn new(root: PathBuf, mode: DataMode) -> Self {
+        Self {
+            root,
+            mode,
+            tor: None,
+        }
+    }
+
+    /// Reach the gateways through `tor` from now on. Kept running for as
+    /// long as this network lives.
+    pub fn with_tor(mut self, tor: Tor) -> Result<Self> {
+        tor.route_nym()?;
+        self.tor = Some(tor);
+        Ok(self)
     }
 
     fn dir(&self, slot: &str) -> Result<PathBuf> {
@@ -37,7 +52,7 @@ impl Network for NymNetwork {
     /// A new slot registers with a gateway chosen uniformly at random by the
     /// SDK, so two slots of the same user don't share a gateway by design.
     async fn open(&self, slot: &str) -> Result<NymTransport> {
-        NymTransport::connect(&self.dir(slot)?).await
+        NymTransport::connect(&self.dir(slot)?, self.mode, self.tor.is_some()).await
     }
 
     fn forget(&self, slot: &str) -> Result<()> {
@@ -54,26 +69,44 @@ impl Network for NymNetwork {
 /// Thin wrapper over a Nym `MixnetClient`: one mix address.
 pub struct NymTransport {
     client: MixnetClient,
+    mode: DataMode,
+    last_send: Option<Instant>,
 }
 
 impl NymTransport {
     /// Connect to the Nym mainnet, keeping the client's keys and gateway
     /// registration in `storage_dir` so the overlay address survives restarts.
     ///
-    /// Background cover traffic and the Poisson send stream are on by default
-    /// in the SDK. Do NOT disable them — they are the anonymity, not overhead
-    /// to trim.
-    pub async fn connect(storage_dir: &Path) -> Result<Self> {
+    /// `mode` sets the rates of the Poisson send stream and of loop cover.
+    /// Never disable either stream — they are the anonymity, not overhead to
+    /// trim; [`DataMode`] only slows them down.
+    ///
+    /// With `over_tor`, a new address only picks gateways that speak TLS, so
+    /// the Tor exit sees an encrypted stream rather than Nym's websocket.
+    pub async fn connect(storage_dir: &Path, mode: DataMode, over_tor: bool) -> Result<Self> {
         crate::create_private_dir(storage_dir)
             .with_context(|| format!("create {}", storage_dir.display()))?;
         let paths = StoragePaths::new_from_dir(storage_dir)?;
+        let mut debug = DebugConfig::default();
+        if let Some((send, cover)) = mode.rates() {
+            debug.traffic.message_sending_average_delay = send;
+            debug.cover_traffic.loop_cover_traffic_average_delay = cover;
+        }
+        // No collector is configured anyway; make sure nothing is reported.
+        debug.stats_reporting.enabled = false;
         let client = MixnetClientBuilder::new_with_default_storage(paths)
             .await?
+            .debug_config(debug)
+            .force_tls(over_tor)
             .build()?
             .connect_to_mixnet()
             .await
             .context("connect to the Nym mixnet")?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            mode,
+            last_send: None,
+        })
     }
 
     /// Wait until everything queued has been handed to the mixnet (or
@@ -88,8 +121,12 @@ impl NymTransport {
             sleep(Duration::from_millis(200)).await;
         }
         // The queue counts messages, not packets already scheduled by the
-        // Poisson sender; give the last ones a moment to leave.
-        sleep(Duration::from_secs(3)).await;
+        // Poisson sender; give the last ones time to get their slots. Only
+        // needed if something was sent lately.
+        let grace = Duration::from_secs(3) + self.mode.send_gap() * 5;
+        if let Some(sent) = self.last_send {
+            sleep(grace.saturating_sub(sent.elapsed())).await;
+        }
     }
 
     /// Flush pending sends, then close the connection to the gateway.
@@ -114,7 +151,9 @@ impl Transport for NymTransport {
         self.client
             .send_message(recipient, pad(payload)?, IncludedSurbs::none())
             .await
-            .context("hand message to the mixnet client")
+            .context("hand message to the mixnet client")?;
+        self.last_send = Some(Instant::now());
+        Ok(())
     }
 
     /// Cover/decoy packets are handled by the SDK and never surface here.
@@ -152,7 +191,7 @@ mod tests {
 
     #[test]
     fn nym_slot_names_cannot_escape_the_root() {
-        let net = NymNetwork::new(PathBuf::from("/tmp/root"));
+        let net = NymNetwork::new(PathBuf::from("/tmp/root"), DataMode::Saver);
         assert!(net.dir("../etc").is_err());
         assert!(net.dir("").is_err());
         assert_eq!(net.dir("ab12").unwrap(), PathBuf::from("/tmp/root/ab12"));

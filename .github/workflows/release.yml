@@ -18,16 +18,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # tor: which Tor Expert Bundle goes in the download. The Tor
+          # Project publishes none for Linux on ARM; there privmsg uses the
+          # system's Tor (`sudo apt install tor`).
           - target: aarch64-apple-darwin
             os: macos-latest
+            tor: macos-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
+            tor: macos-x86_64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            tor: linux-x86_64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            tor: ""
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            tor: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +52,14 @@ jobs:
           name="privmsg-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp README.md LICENSE "$name/"
+          if [ -n "${{ matrix.tor }}" ]; then
+            scripts/fetch-tor.sh "$name" "${{ matrix.tor }}"
+            # Smoke test: the bundled Tor runs here (the Intel Mac build is
+            # made on an Apple-silicon runner, so it can't be run there).
+            if [ "${{ matrix.target }}" != x86_64-apple-darwin ]; then
+              LD_LIBRARY_PATH="$name/tor" "$name/tor/tor" --version
+            fi
+          fi
           if [ "$RUNNER_OS" = Windows ]; then
             cp "target/${{ matrix.target }}/release/privmsg.exe" "$name/"
             7z a "$name.zip" "$name"

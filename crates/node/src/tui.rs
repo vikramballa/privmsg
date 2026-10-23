@@ -564,7 +564,16 @@ fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>) {
     if let Some(s) = scheduler {
         status = format!("[decoys on, {} queued] {status}", s.queued());
     }
+    let settings = node.settings();
+    let tor = if settings.tor { "Tor on" } else { "Tor off" };
+    let network = format!(" {tor} · data: {} ", settings.data_mode.name());
+    let [status_area, network_area] = Layout::horizontal([
+        Constraint::Min(10),
+        Constraint::Length(network.len() as u16),
+    ])
+    .areas(status_area);
     f.render_widget(Paragraph::new(status).dim(), status_area);
+    f.render_widget(Paragraph::new(network).dim().reversed(), network_area);
 }
 
 /// The newest lines that fit in `area` once wrapped, oldest first.

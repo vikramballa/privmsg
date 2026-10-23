@@ -26,3 +26,6 @@ privmsg.log
 /fuzz/target/
 /fuzz/corpus/
 /fuzz/artifacts/
+
+# docs files
+/docs

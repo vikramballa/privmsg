@@ -134,6 +134,10 @@ impl Node {
         self.profile.slots_dir()
     }
 
+    pub fn tor_dir(&self) -> PathBuf {
+        self.profile.tor_dir()
+    }
+
     pub fn contacts(&self) -> &[Contact] {
         &self.state.contacts
     }

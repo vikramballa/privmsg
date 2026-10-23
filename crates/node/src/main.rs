@@ -29,7 +29,7 @@ use privmsg_crypto::{Identity, Session};
 use privmsg_node::app::{Event, Node};
 use privmsg_node::decoy::{self, Scheduler};
 use privmsg_node::store::{HistoryEntry, Profile, Settings};
-use privmsg_transport::{Mux, NymNetwork};
+use privmsg_transport::{DataMode, Mux, NymNetwork, Tor};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
@@ -56,6 +56,9 @@ commands:
   remove <name>           forget a contact or unused invite and its addresses
   address                 show your mix address for each contact
   decoys [on|off|<secs>]  show or set decoy traffic (mean seconds between sends)
+  data [saver|balanced|maximum]
+                          show or set how much internet data privmsg uses
+  tor [on|off]            show or set hiding your IP address with Tor (default on)
   keychain save|forget    keep the passphrase in the macOS keychain, or stop
   selftest                offline check of the encryption layer
 
@@ -126,6 +129,10 @@ async fn main() -> Result<()> {
         ["remove", name] => remove(data_dir, name).await,
         ["decoys"] => decoys(data_dir, None),
         ["decoys", setting] => decoys(data_dir, Some(setting)),
+        ["data"] => data_mode(data_dir, None),
+        ["data", mode] => data_mode(data_dir, Some(mode)),
+        ["tor"] => tor(data_dir, None),
+        ["tor", setting] => tor(data_dir, Some(setting)),
         ["keychain", "save"] => keychain_save(data_dir),
         ["keychain", "forget"] => keychain_forget(data_dir),
         ["help"] | ["-h"] | ["--help"] => {
@@ -262,7 +269,17 @@ async fn start(dir: PathBuf) -> Result<()> {
 
 /// A multiplexer over this profile's Nym addresses, with `slots` online.
 pub(crate) async fn connect(node: &mut Node, slots: &[String]) -> Result<Network> {
-    let mut mux = Mux::new(NymNetwork::new(node.slots_dir()));
+    let mut net = NymNetwork::new(node.slots_dir(), node.settings().data_mode);
+    // Even with nothing to open yet: the app opens addresses later (invites).
+    if node.settings().tor {
+        eprintln!("Starting Tor, so the network can't see your IP address…");
+        let tor = Tor::start(&node.tor_dir(), |percent| eprint!("\r  Tor: {percent}%  "))
+            .await
+            .context("start Tor")?;
+        eprintln!();
+        net = net.with_tor(tor)?;
+    }
+    let mut mux = Mux::new(net);
     eprintln!("Connecting securely through the Nym network (about 10 seconds)…");
     node.connect(&mut mux, slots).await?;
     Ok(mux)
@@ -409,7 +426,7 @@ async fn rotate(dir: PathBuf, name: &str) -> Result<()> {
 async fn remove(dir: PathBuf, name: &str) -> Result<()> {
     let mut node = open(&dir)?;
     // Removing only deletes local keys; nothing needs to be online.
-    let mut mux = Mux::new(NymNetwork::new(node.slots_dir()));
+    let mut mux = Mux::new(NymNetwork::new(node.slots_dir(), node.settings().data_mode));
     node.remove(&mut mux, name).await?;
     println!("{name} removed, with its addresses and conversation keys.");
     Ok(())
@@ -429,7 +446,10 @@ fn decoys(dir: PathBuf, setting: Option<&str>) -> Result<()> {
                 ),
             },
         };
-        node.set_settings(Settings { decoy_interval })?;
+        node.set_settings(Settings {
+            decoy_interval,
+            ..node.settings().clone()
+        })?;
     }
     match node.settings().decoy_interval {
         None => println!("decoys off: messages go out as soon as you send them"),
@@ -437,6 +457,59 @@ fn decoys(dir: PathBuf, setting: Option<&str>) -> Result<()> {
             "decoys on: while connected, each conversation sends a message or a decoy \
              every ~{n}s at random; your messages wait for the next one"
         ),
+    }
+    Ok(())
+}
+
+fn data_mode(dir: PathBuf, setting: Option<&str>) -> Result<()> {
+    let mut node = open(&dir)?;
+    if let Some(setting) = setting {
+        node.set_settings(Settings {
+            data_mode: setting.parse()?,
+            ..node.settings().clone()
+        })?;
+    }
+    let current = node.settings().data_mode;
+    for mode in DataMode::ALL {
+        let mark = if mode == current { "→" } else { " " };
+        let about = match mode {
+            DataMode::Saver => "messages take a few seconds",
+            DataMode::Balanced => "messages take a second or two, more cover",
+            DataMode::Maximum => "instant, the most cover; heavy on data",
+        };
+        println!(
+            "{mark} {:<9} ~{} MB an hour per contact while open; {about}",
+            mode.name(),
+            mode.mb_per_hour()
+        );
+    }
+    println!("Nothing is used while privmsg is closed. Changes apply the next time it connects.");
+    Ok(())
+}
+
+fn tor(dir: PathBuf, setting: Option<&str>) -> Result<()> {
+    let mut node = open(&dir)?;
+    if let Some(setting) = setting {
+        let tor = match setting {
+            "on" => true,
+            "off" => false,
+            _ => bail!("use `on` or `off`"),
+        };
+        node.set_settings(Settings {
+            tor,
+            ..node.settings().clone()
+        })?;
+    }
+    if node.settings().tor {
+        println!(
+            "Tor on: privmsg reaches the Nym network through Tor, so the Nym servers \
+             and your network never see your IP address together with privmsg."
+        );
+    } else {
+        println!(
+            "Tor off: the first Nym server you connect to sees your IP address (not your \
+             messages or who you talk to). Turn it back on with `privmsg tor on`."
+        );
     }
     Ok(())
 }

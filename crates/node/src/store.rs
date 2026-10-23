@@ -5,7 +5,7 @@
 //! `state.enc`, sealed with a key derived from the user's passphrase:
 //!
 //! ```text
-//! "PRIVMSG2" | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
+//! "PRIVMSG3" | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
 //! ```
 //!
 //! The key is Argon2id(passphrase, salt). The header is bound as AEAD
@@ -15,6 +15,8 @@
 //! Version 1 profiles (`"PRIVMSG1"`, one mix address for everything) are
 //! upgraded on open: their single Nym client moves to the slot
 //! [`LEGACY_SLOT`], and every contact is due for an address rotation.
+//! Version 2 profiles (`"PRIVMSG2"`) only lack the network settings and get
+//! the defaults.
 //!
 //! Not covered: the Nym clients' own files under `slots/` (their keys and
 //! gateway registrations) are written by the Nym SDK and are not encrypted
@@ -29,10 +31,12 @@ use argon2::Argon2;
 use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use privmsg_transport::DataMode;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"PRIVMSG2";
+const MAGIC: &[u8; 8] = b"PRIVMSG3";
+const MAGIC_V2: &[u8; 8] = b"PRIVMSG2";
 const MAGIC_V1: &[u8; 8] = b"PRIVMSG1";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
@@ -40,6 +44,7 @@ const HEADER_LEN: usize = MAGIC.len() + SALT_LEN;
 const STATE_FILE: &str = "state.enc";
 const LOCK_FILE: &str = "lock";
 const SLOTS_DIR: &str = "slots";
+const TOR_DIR: &str = "tor";
 /// Where a version 1 profile kept its one Nym client.
 const NYM_DIR_V1: &str = "nym";
 
@@ -62,11 +67,25 @@ pub struct State {
     pub settings: Settings,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Settings {
     /// Mean seconds between decoy-or-real sends per conversation while
     /// connected. `None` = decoys off, messages go out immediately.
     pub decoy_interval: Option<u32>,
+    /// How much cover traffic each open address sends.
+    pub data_mode: DataMode,
+    /// Reach the Nym gateways through Tor, so they never see our IP.
+    pub tor: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            decoy_interval: None,
+            data_mode: DataMode::default(),
+            tor: true,
+        }
+    }
 }
 
 /// One of our own mix addresses. Each conversation (and each open invite)
@@ -130,6 +149,35 @@ pub struct PendingInvite {
     /// The fresh address in this invite; the Join must arrive here, and it
     /// becomes our address for the new contact.
     pub slot: Slot,
+}
+
+/// The version 2 state layout: the same, with only decoys in the settings.
+mod v2 {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct State {
+        pub identity: Vec<u8>,
+        pub contacts: Vec<super::Contact>,
+        pub invites: Vec<super::PendingInvite>,
+        pub pending: Vec<super::PendingMessage>,
+        pub decoy_interval: Option<u32>,
+    }
+}
+
+impl From<v2::State> for State {
+    fn from(old: v2::State) -> Self {
+        State {
+            identity: old.identity,
+            contacts: old.contacts,
+            invites: old.invites,
+            pending: old.pending,
+            settings: Settings {
+                decoy_interval: old.decoy_interval,
+                ..Settings::default()
+            },
+        }
+    }
 }
 
 /// The version 1 state layout, kept only to upgrade old profiles.
@@ -245,7 +293,10 @@ impl Profile {
         let lock = lock(dir)?;
         let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let version_1 = data.starts_with(MAGIC_V1);
-        if data.len() < HEADER_LEN + NONCE_LEN || !(data.starts_with(MAGIC) || version_1) {
+        let version_2 = data.starts_with(MAGIC_V2);
+        if data.len() < HEADER_LEN + NONCE_LEN
+            || !(data.starts_with(MAGIC) || version_2 || version_1)
+        {
             bail!("{} is not a privmsg profile", path.display());
         }
         let salt: [u8; SALT_LEN] = data[MAGIC.len()..HEADER_LEN].try_into()?;
@@ -269,6 +320,14 @@ impl Profile {
             key,
             _lock: lock,
         };
+        if version_2 {
+            let old: v2::State =
+                bincode::deserialize(&plaintext).context("decode profile state")?;
+            let state = State::from(old);
+            profile.save(&state)?;
+            tracing::info!("upgraded profile to version 3");
+            return Ok((profile, state));
+        }
         if !version_1 {
             let state = bincode::deserialize(&plaintext).context("decode profile state")?;
             return Ok((profile, state));
@@ -328,6 +387,11 @@ impl Profile {
     /// Where each slot's Nym client keeps its keys and gateway registration.
     pub fn slots_dir(&self) -> PathBuf {
         self.dir.join(SLOTS_DIR)
+    }
+
+    /// Tor's state: its directory cache and entry guards.
+    pub fn tor_dir(&self) -> PathBuf {
+        self.dir.join(TOR_DIR)
     }
 
     pub fn dir(&self) -> &Path {
@@ -421,9 +485,14 @@ mod tests {
 
     /// Write `state` the way version 1 did.
     fn write_v1(dir: &Path, passphrase: &str, state: &[u8]) -> Result<()> {
+        write_old(MAGIC_V1, dir, passphrase, state)
+    }
+
+    /// Write `state` under an older format's `magic`.
+    fn write_old(magic: &[u8; 8], dir: &Path, passphrase: &str, state: &[u8]) -> Result<()> {
         let salt = [3u8; SALT_LEN];
         let key = derive_key(passphrase, &salt)?;
-        let mut header = MAGIC_V1.to_vec();
+        let mut header = magic.to_vec();
         header.extend_from_slice(&salt);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ct = XChaCha20Poly1305::new(key.as_ref().into())
@@ -485,8 +554,45 @@ mod tests {
         drop(profile);
 
         let raw = fs::read(dir.path().join(STATE_FILE))?;
-        assert!(raw.starts_with(MAGIC), "rewritten as version 2");
+        assert!(raw.starts_with(MAGIC), "rewritten as the current version");
         assert_eq!(Profile::open(dir.path(), "pw")?.1.contacts[0].name, "bob");
+        Ok(())
+    }
+
+    #[test]
+    fn version_2_profile_gets_default_network_settings() -> Result<()> {
+        #[derive(Serialize)]
+        struct V2 {
+            identity: Vec<u8>,
+            contacts: Vec<Contact>,
+            invites: Vec<PendingInvite>,
+            pending: Vec<PendingMessage>,
+            decoy_interval: Option<u32>,
+        }
+        let current = sample_state();
+        let old = V2 {
+            identity: current.identity,
+            contacts: current.contacts,
+            invites: current.invites,
+            pending: current.pending,
+            decoy_interval: Some(30),
+        };
+        let dir = tempfile::tempdir()?;
+        write_old(MAGIC_V2, dir.path(), "pw", &bincode::serialize(&old)?)?;
+
+        let (profile, state) = Profile::open(dir.path(), "pw")?;
+        assert_eq!(state.contacts[0].history[0].text, "hi");
+        assert_eq!(
+            state.settings,
+            Settings {
+                decoy_interval: Some(30),
+                data_mode: DataMode::Saver,
+                tor: true,
+            }
+        );
+        drop(profile);
+        let raw = fs::read(dir.path().join(STATE_FILE))?;
+        assert!(raw.starts_with(MAGIC), "rewritten as the current version");
         Ok(())
     }
 

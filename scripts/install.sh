@@ -25,6 +25,12 @@ mkdir -p "$DEST"
 cp target/release/privmsg "$DEST/privmsg"
 say "Installed: $DEST/privmsg"
 
+say "Downloading Tor (privmsg uses it to hide your IP address)…"
+if ! scripts/fetch-tor.sh "$DEST"; then
+  command -v tor >/dev/null && echo "Using the Tor already installed: $(command -v tor)" \
+    || echo "Without Tor, privmsg won't connect until you install it or run \`privmsg tor off\`."
+fi
+
 case ":$PATH:" in
   *":$DEST:"*) ready=1 ;;
   *) ready=0 ;;

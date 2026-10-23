@@ -59,6 +59,16 @@ openmls_traits = "0.3"
 # pins the whole Nym tree to the matching 1.21.6 set — do not run a blanket
 # `cargo update`; update Nym only by moving every nym-* crate together.
 nym-sdk = "=1.21.6"
+# Used directly only to point Nym at Tor (see crates/transport/src/tor.rs).
+nym-gateway-client = "=1.21.6"
+nym-http-api-client = "=1.21.6"
+# Same version Nym's HTTP client uses; we only add SOCKS support to it.
+reqwest = { version = "=0.13.5", default-features = false, features = ["socks"] }
+
+[patch.crates-io]
+# Nym's gateway client with one addition: connect through Tor's SOCKS port.
+# See vendor/README.md.
+nym-gateway-client = { path = "vendor/nym-gateway-client" }
 
 # OpenMLS 0.6 has `debug_assert!(false)` on AEAD failure, so in debug builds a
 # single corrupted or forged packet from the network would panic the node.
