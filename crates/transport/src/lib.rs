@@ -25,12 +25,20 @@
 //! On top of Nym, every payload is padded to a multiple of [`PAD_BLOCK`]
 //! before it is sent. A long message still splits into more Sphinx packets
 //! than a short one, so without padding the packet count would leak message
-//! length; with it, every ordinary chat message costs the same.
+//! length; with it, every ordinary chat message costs the same: one packet.
 //!
 //! [`Transport`] is one endpoint: one mix address. [`Network`] opens
 //! endpoints by *slot* name, and [`Mux`] holds several open at once and tags
 //! every arrival with the slot it came in on. privmsg gives each
 //! conversation its own slot, so no two conversations share an address.
+//!
+//! Slots only receive. Everything goes out through one extra endpoint, the
+//! *sender*, whose address is never given to anyone. A Sphinx packet carries
+//! no sender address, so a contact can't tell which of our endpoints wrote,
+//! and the expensive part — the Poisson send stream that real packets hide
+//! in — runs once instead of once per conversation. Slots keep a slow loop
+//! cover stream so their gateways can't simply count what arrives.
+//!
 //! [`NymNetwork`] is the real mixnet; [`memory::MemoryNetwork`] is an
 //! in-process stand-in for tests. This is the only crate that touches Nym.
 
@@ -88,16 +96,22 @@ pub trait Transport {
 pub trait Network {
     type Endpoint: Transport + Send;
 
+    /// A receive-only endpoint for `slot`.
     fn open(&self, slot: &str) -> impl Future<Output = Result<Self::Endpoint>> + Send;
+
+    /// The endpoint everything is sent from. Its address is never shared.
+    fn open_sender(&self) -> impl Future<Output = Result<Self::Endpoint>> + Send;
 
     /// Destroy a slot's keys for good. Its address can never receive again.
     fn forget(&self, slot: &str) -> Result<()>;
 }
 
-/// Several open endpoints, received from as one.
+/// Several open slots, received from as one, plus the sender.
 pub struct Mux<N: Network> {
     net: N,
     open: Vec<(String, N::Endpoint)>,
+    /// `None` until something needs it, and while asleep.
+    sender: Option<N::Endpoint>,
 }
 
 impl<N: Network> Mux<N> {
@@ -105,6 +119,7 @@ impl<N: Network> Mux<N> {
         Self {
             net,
             open: Vec::new(),
+            sender: None,
         }
     }
 
@@ -117,11 +132,21 @@ impl<N: Network> Mux<N> {
     }
 
     /// Open every slot in `slots` that is not open yet, concurrently (each
-    /// mixnet connection takes seconds). Returns the address of each.
+    /// mixnet connection takes seconds), and the sender alongside so the
+    /// first message doesn't wait for it. Returns the address of each slot.
     pub async fn open(&mut self, slots: &[String]) -> Result<Vec<MixAddress>> {
         let missing: Vec<&String> = slots.iter().filter(|s| !self.is_open(s)).collect();
-        let opened =
-            futures::future::join_all(missing.iter().map(|slot| self.net.open(slot))).await;
+        let wake = !slots.is_empty() && self.sender.is_none();
+        let (opened, sender) = futures::join!(
+            futures::future::join_all(missing.iter().map(|slot| self.net.open(slot))),
+            async {
+                if wake {
+                    Some(self.net.open_sender().await)
+                } else {
+                    None
+                }
+            }
+        );
         let mut first_error = None;
         for (slot, endpoint) in missing.into_iter().zip(opened) {
             match endpoint {
@@ -130,6 +155,13 @@ impl<N: Network> Mux<N> {
                     first_error.get_or_insert(e.context(format!("open address {slot}")));
                 }
             }
+        }
+        match sender {
+            Some(Ok(sender)) => self.sender = Some(sender),
+            Some(Err(e)) => {
+                first_error.get_or_insert(e.context("open the sender"));
+            }
+            None => {}
         }
         if let Some(e) = first_error {
             return Err(e);
@@ -140,11 +172,32 @@ impl<N: Network> Mux<N> {
             .collect())
     }
 
-    pub async fn send(&mut self, slot: &str, to: &MixAddress, payload: &[u8]) -> Result<()> {
-        self.endpoint_mut(slot)
-            .ok_or_else(|| anyhow!("address {slot} is not open"))?
-            .send(to, payload)
-            .await
+    /// Send through the sender, waking it first if needed.
+    pub async fn send(&mut self, to: &MixAddress, payload: &[u8]) -> Result<()> {
+        self.wake().await?;
+        let sender = self.sender.as_mut().expect("awake");
+        sender.send(to, payload).await
+    }
+
+    /// Bring the sender online if it isn't.
+    pub async fn wake(&mut self) -> Result<()> {
+        if self.sender.is_none() {
+            self.sender = Some(self.net.open_sender().await.context("open the sender")?);
+        }
+        Ok(())
+    }
+
+    /// Whether the sender is online (its cover stream running).
+    pub fn is_awake(&self) -> bool {
+        self.sender.is_some()
+    }
+
+    /// Flush and close the sender, stopping its cover stream; the next
+    /// [`send`](Self::send) brings it back. Slots keep receiving.
+    pub async fn sleep(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            sender.close().await;
+        }
     }
 
     /// The next message on any open slot, with the slot it arrived on.
@@ -175,35 +228,30 @@ impl<N: Network> Mux<N> {
 
     /// Flush and close every endpoint.
     pub async fn close(self) {
-        futures::future::join_all(self.open.into_iter().map(|(_, e)| e.close())).await;
+        let endpoints = self.open.into_iter().map(|(_, e)| e).chain(self.sender);
+        futures::future::join_all(endpoints.map(Transport::close)).await;
     }
 
     fn endpoint(&self, slot: &str) -> Option<&N::Endpoint> {
         self.open.iter().find(|(s, _)| s == slot).map(|(_, e)| e)
     }
-
-    fn endpoint_mut(&mut self, slot: &str) -> Option<&mut N::Endpoint> {
-        self.open
-            .iter_mut()
-            .find(|(s, _)| s == slot)
-            .map(|(_, e)| e)
-    }
 }
 
-/// How much cover traffic each open address sends: the trade between data
-/// used and how thick the stream your real packets hide in is.
+/// How much cover traffic is sent: the trade between data used and how
+/// thick the stream your real packets hide in is.
 ///
-/// Every mode keeps both Nym streams running — a constant Poisson-timed
-/// send stream (real packets take the next slot, cover fills the rest) and
-/// loop cover — so real sends never show up as a burst; only the rate
-/// changes. Measured on mainnet, the SDK default ([`DataMode::Maximum`])
-/// costs about 860 MB an hour per open address.
+/// The sender keeps both Nym streams running in every mode — a constant
+/// Poisson-timed send stream (real packets take the next slot, cover fills
+/// the rest) and loop cover — so real sends never show up as a burst; only
+/// the rate changes. Slots never send, so they run loop cover alone, slower.
+/// Measured on mainnet, the SDK default ([`DataMode::Maximum`]) costs about
+/// 860 MB an hour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataMode {
-    /// About 10 MB an hour per address; messages wait a few seconds.
+    /// About 10 MB an hour; messages wait a few seconds.
     #[default]
     Saver,
-    /// About 35 MB an hour per address; messages wait a second or two.
+    /// About 35 MB an hour; messages wait a second or two.
     Balanced,
     /// The SDK default, tuned for a VPN's worth of traffic.
     Maximum,
@@ -220,7 +268,7 @@ impl DataMode {
         }
     }
 
-    /// Rough data use per open address per hour, for the user.
+    /// Rough data use of the sender per hour, for the user.
     pub fn mb_per_hour(self) -> u32 {
         match self {
             DataMode::Saver => 10,
@@ -229,13 +277,32 @@ impl DataMode {
         }
     }
 
-    /// Mean gaps of the send stream and of loop cover, or `None` to keep
-    /// the SDK defaults (20 ms and 200 ms).
+    /// Rough data use of each open slot per hour, for the user.
+    pub fn slot_mb_per_hour(self) -> f32 {
+        match self {
+            DataMode::Saver => 0.6,
+            DataMode::Balanced => 2.3,
+            DataMode::Maximum => 18.0,
+        }
+    }
+
+    /// Mean gaps of the sender's send stream and of its loop cover, or
+    /// `None` to keep the SDK defaults (20 ms and 200 ms).
     pub fn rates(self) -> Option<(Duration, Duration)> {
         match self {
             DataMode::Saver => Some((Duration::from_secs(2), Duration::from_secs(8))),
             DataMode::Balanced => Some((Duration::from_millis(500), Duration::from_secs(4))),
             DataMode::Maximum => None,
+        }
+    }
+
+    /// Mean gap of a slot's loop cover. Every loop packet comes back through
+    /// the slot's gateway looking like a delivered message.
+    pub fn slot_loop(self) -> Duration {
+        match self {
+            DataMode::Saver => Duration::from_secs(30),
+            DataMode::Balanced => Duration::from_secs(8),
+            DataMode::Maximum => Duration::from_secs(1),
         }
     }
 
@@ -257,8 +324,10 @@ impl std::str::FromStr for DataMode {
     }
 }
 
-/// Payloads are padded up to a multiple of this many bytes.
-pub const PAD_BLOCK: usize = 2048;
+/// Payloads are padded up to a multiple of this many bytes: exactly what
+/// one Nym packet carries once Nym has added its own framing, so `k` blocks
+/// travel as `k` packets (checked against Nym's code in `nym.rs`).
+pub const PAD_BLOCK: usize = 1602;
 
 /// Largest payload accepted, before padding.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
@@ -300,6 +369,7 @@ pub fn unpad(frame: &[u8]) -> Result<Vec<u8>> {
 /// messages for an address that is offline and delivers them on reconnect.
 pub mod memory {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use anyhow::{anyhow, Result};
@@ -312,6 +382,7 @@ pub mod memory {
     #[derive(Clone, Default)]
     pub struct MemoryNetwork {
         inboxes: Arc<Mutex<HashMap<String, Inbox>>>,
+        senders: Arc<AtomicUsize>,
     }
 
     impl MemoryNetwork {
@@ -349,6 +420,11 @@ pub mod memory {
 
         async fn open(&self, slot: &str) -> Result<MemoryTransport> {
             self.connect(slot)
+        }
+
+        async fn open_sender(&self) -> Result<MemoryTransport> {
+            let n = self.senders.fetch_add(1, Ordering::Relaxed);
+            self.connect(&format!("sender-{n}"))
         }
 
         fn forget(&self, slot: &str) -> Result<()> {
@@ -417,7 +493,7 @@ mod tests {
             assert_eq!(frame.len(), PAD_BLOCK, "short messages share one size");
             assert_eq!(unpad(&frame)?, payload);
         }
-        let big = vec![1u8; PAD_BLOCK];
+        let big = vec![1u8; PAD_BLOCK - LEN_PREFIX + 1];
         let frame = pad(&big)?;
         assert_eq!(frame.len(), 2 * PAD_BLOCK);
         assert_eq!(unpad(&frame)?, big);
@@ -476,13 +552,40 @@ mod tests {
         assert_eq!(got[0].1.payload, b"to one");
         assert_eq!(got[1].0, "two");
 
-        mux.send("one", &MixAddress("peer".into()), b"reply")
-            .await?;
-        assert_eq!(peer.recv().await?.payload, b"reply");
-        assert!(mux.send("nope", &addrs[0], b"x").await.is_err());
-
         mux.forget("one").await?;
         assert!(!mux.is_open("one") && mux.is_open("two"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn everything_goes_out_through_the_sender() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let mut mux = Mux::new(net.clone());
+        let mut peer = net.connect("peer")?;
+        let peer_addr = MixAddress("peer".into());
+
+        // Sending needs no slot; the sender wakes on demand.
+        assert!(!mux.is_awake());
+        mux.send(&peer_addr, b"first").await?;
+        assert!(mux.is_awake());
+        assert_eq!(peer.recv().await?.payload, b"first");
+
+        // Opening slots brings the sender up with them.
+        mux.sleep().await;
+        assert!(!mux.is_awake());
+        let addrs = mux.open(&["one".to_string()]).await?;
+        assert!(mux.is_awake());
+
+        // Replies reach the slot, never the sender's own address.
+        mux.send(&peer_addr, b"hi").await?;
+        assert_eq!(peer.recv().await?.payload, b"hi");
+        peer.send(&addrs[0], b"reply").await?;
+        let (slot, msg) = mux.recv().await?;
+        assert_eq!(
+            (slot.as_str(), msg.payload.as_slice()),
+            ("one", &b"reply"[..])
+        );
+        mux.close().await;
         Ok(())
     }
 }

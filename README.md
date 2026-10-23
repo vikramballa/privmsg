@@ -17,6 +17,10 @@ both:
   with someone by swapping a one-time invite code.
 - 🧩 **A different address for every contact**, replaced every week, so
   your conversations can't be linked to each other by address.
+- 🧅 **Tor built in**, so not even the Nym servers see your IP address.
+- 💨 **Disappearing messages** that are deleted on both sides.
+- 📶 **Light on data:** about 9 MB an hour in the default mode, and nothing
+  at all while it's closed.
 
 > ⚠️ **Status: prototype.** It works end to end on the live Nym network,
 > but it has **not been independently security-audited**. Please don't
@@ -25,18 +29,42 @@ both:
 ---
 
 ## Contents
+- [What's new in v0.2.0](#whats-new-in-v020)
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Where your data lives](#where-your-data-lives)
-- [Addresses, rotation and decoys](#addresses-rotation-and-decoys)
+- [Privacy features](#privacy-features)
 - [Internet data and Tor](#internet-data-and-tor)
 - [What it protects (and what it doesn't)](#what-it-protects-and-what-it-doesnt)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
 - [For developers](#for-developers)
 - [License](#license)
+
+---
+
+## What's new in v0.2.0
+
+- **Tor is built in and on by default.** The Nym servers no longer see your
+  IP address. The download includes Tor; nothing extra to install.
+- **Far less internet data.** The default `saver` mode uses about 9 MB an
+  hour instead of hundreds, and each extra contact adds under 1 MB. One
+  connection now sends for all your contacts (see
+  [One sender, many quiet mailboxes](#one-sender-many-quiet-mailboxes)).
+- **Faster messages.** Every short message now fits in a single network
+  packet, so it typically arrives in about 3 seconds instead of 7.
+- ### Disappearing messages
+
+Press **Ctrl-D** in a chat. Both sides delete
+  old messages.
+- **Auto-sleep (optional).** `privmsg sleep 10` pauses the background
+  traffic when you're not typing, to save even more data.
+
+⚠️ **Everyone needs v0.2.0.** It can't exchange messages with v0.1.0, so
+ask your contacts to update too. Your existing profile is upgraded
+automatically, contacts and history included.
 
 ---
 
@@ -73,8 +101,7 @@ both:
 ```
 
 Each layer only knows what it needs to: the mixnet never sees your message,
-and the encryption layer never sees an IP address. The full design is in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+and the encryption layer never sees an IP address.
 
 ---
 
@@ -199,6 +226,7 @@ and press **Enter**.
 |---|---|
 | **Ctrl-N** | Invite a friend |
 | **Ctrl-O** | Enter an invite code someone sent you |
+| **Ctrl-D** | Disappearing messages for this chat: off → 5 min → 1 hour → 1 day → 1 week |
 | **↑ / ↓** | Switch between conversations |
 | **Enter** | Send |
 | **Esc** | Cancel, or quit |
@@ -206,8 +234,10 @@ and press **Enter**.
 💡 Your friend doesn't need to be online. Messages wait on the Nym network
 and arrive the next time they open privmsg.
 
-💡 Connecting takes about 10 seconds, and each message takes a few seconds
-to arrive. That delay is part of what makes the traffic hard to analyse.
+💡 The very first start takes up to a minute (Tor and Nym are setting up);
+after that, starting takes about 15 seconds. Each message takes a few
+seconds to arrive. That delay is part of what makes the traffic hard to
+analyse.
 
 💡 Whoever uses an invite first becomes that contact, so send codes in a
 chat you trust. Once connected, check it's really your friend.
@@ -231,12 +261,14 @@ users on your computer, connects them, and opens a chat window for each.
 | `privmsg listen [seconds]` | Just receive messages (Ctrl-C to stop) |
 | `privmsg contacts` | List contacts, unread counts and unused invites |
 | `privmsg history <name>` | Show saved messages with a contact |
+| `privmsg disappear <name> [off\|5m\|1h\|1d\|1w]` | Show or set disappearing messages with a contact (applies on both sides) |
 | `privmsg rotate <name>` | Move a conversation to a new address now (it also happens weekly by itself) |
 | `privmsg remove <name>` | Forget a contact or unused invite, with its addresses and keys |
 | `privmsg address` | Show your mix address for each contact |
 | `privmsg decoys [on\|off\|<seconds>]` | Show or set decoy traffic (see below) |
 | `privmsg data [saver\|balanced\|maximum]` | Show or set how much internet data privmsg uses (see below) |
 | `privmsg tor [on\|off]` | Show or set hiding your IP address with Tor (on by default) |
+| `privmsg sleep [off\|<minutes>]` | Show or set auto-sleep: stop the cover traffic after that many minutes without typing (off by default, see below) |
 | `privmsg keychain save` / `forget` | Keep the passphrase in the macOS keychain so privmsg stops asking, or remove it |
 | `privmsg selftest` | Offline check of the encryption layer |
 
@@ -262,7 +294,7 @@ other PCs and OneDrive doesn't back up):
 | File | Contents | Protected? |
 |---|---|---|
 | `state.enc` | Your keys, contacts, conversations, message history | ✅ Encrypted with your passphrase (Argon2id + XChaCha20-Poly1305) |
-| `slots/` | One folder of Nym network keys per address (one per contact and per open invite) | ⚠️ Not encrypted by privmsg, only by folder permissions: only your user account can open the profile folder (mode 0700 on Mac and Linux; on Windows an access list with your account as the only entry) |
+| `slots/` | One folder of Nym network keys per address (one per contact and per open invite, plus `sender`, which sends everything) | ⚠️ Not encrypted by privmsg, only by folder permissions: only your user account can open the profile folder (mode 0700 on Mac and Linux; on Windows an access list with your account as the only entry) |
 | `tor/` | Tor's directory cache and entry guards, so later starts are quick | Folder permissions, like `slots/` |
 | `lock` | Stops two copies of privmsg using the same profile | — |
 
@@ -271,24 +303,32 @@ profile can't be opened. That's by design.
 
 Profiles made by older versions are upgraded automatically the first time
 you open them. Your existing contacts then move to fresh addresses of their
-own the next time you're connected (both sides need the new version).
+own the next time you're connected. ⚠️ You and your contacts all need the
+same version: messages from this version can't be read by older ones, and
+the other way round.
 
 ---
 
-## Addresses, rotation and decoys
+## Privacy features
 
-**One address per contact.** Every invite you create, and every invite you
+### One address per contact
+
+Every invite you create, and every invite you
 accept, gets its own Nym address (its own keys and a randomly chosen
 gateway). Two people you talk to can't compare notes and find out they're
 talking to the same person.
 
-**Weekly rotation.** Each conversation's address is replaced every 7 days
+### Weekly rotation
+
+Each conversation's address is replaced every 7 days
 while you're connected (or on demand with `privmsg rotate <name>`). Your
 contact is told the new address inside the encrypted conversation and
 confirms it; the old address keeps listening for a day after that, then its
 keys are deleted.
 
-**Decoys (optional).** `privmsg decoys on` makes each conversation send
+### Decoys (optional)
+
+`privmsg decoys on` makes each conversation send
 something at random moments (every ~10 s on average) whenever you're in
 `ui`, `chat` or `listen`. That's either a waiting message or a meaningless
 decoy, so someone counting packets can't tell when you actually write.
@@ -296,39 +336,74 @@ The cost is bandwidth and a delay of a few seconds per message.
 `privmsg decoys 30` picks a different average; `privmsg decoys off` turns
 them off. A one-off `privmsg send` always goes out immediately.
 
-Each address is a separate Nym client with its own cover traffic, so many
-contacts means more background traffic. That's expected.
+### One sender, many quiet mailboxes
+
+Your per-contact addresses only
+*receive*. Everything you send goes out through one extra connection, the
+*sender*, whose address is never given to anyone. Nym packets carry no
+sender address, so your contacts still can't tell which connection wrote to
+them. The sender runs the full fake-packet stream; each mailbox runs only a
+slow trickle of fake packets, so its server can't simply count the messages
+it receives. That's why extra contacts cost little data.
+
+### Disappearing messages
+
+Press **Ctrl-D** in a chat (or
+`privmsg disappear <name> 1h`) to have messages deleted once they're older
+than 5 minutes, 1 hour, 1 day or 1 week. Your contact's app is told and
+deletes them too, and messages already older than that go at once. Deleted
+messages are removed from the encrypted `state.enc`; a disk can keep old
+copies of that file for a while, but they're still locked with your
+passphrase.
 
 ---
 
 ## Internet data and Tor
 
-**Data modes.** To hide when you're really chatting, privmsg keeps sending
+### Data modes
+
+To hide when you're really chatting, privmsg keeps sending
 fake packets while it's open, and your real messages blend into that
 stream. How thick the stream is decides how much data privmsg uses:
 
-| Mode | Data per contact, per hour open | A message takes | |
+| Mode | Data per hour open | A message takes | |
 |---|---|---|---|
-| `saver` (default) | about **8 MB** | ~7 seconds | good cover |
-| `balanced` | about **32 MB** | ~2 seconds | more cover |
-| `maximum` | about **860 MB** | instant | Nym's own default, built for a VPN |
+| `saver` (default) | about **9 MB**, plus under 1 MB per contact | ~3 seconds | good cover |
+| `balanced` | about **32 MB**, plus about 2 MB per contact | ~2 seconds | more cover |
+| `maximum` | about **860 MB**, plus about 18 MB per contact | instant | Nym's own default, built for a VPN |
 
-Measured on the live Nym network (October 2026). Change it with
-`privmsg data balanced` (it applies the next time privmsg connects).
-**When privmsg is closed it uses no data at all.** Every mode keeps the
-fake-packet stream running, so sending a message never makes a burst
-someone could spot; only the stream's speed changes.
+Measured on the live Nym network (October 2026; `saver` with two contacts:
+8.7–10.5 MB an hour). Tor carries all of it and adds its own overhead: in
+the same test, the total going out to the internet was about twice
+privmsg's own figure. Change the mode with `privmsg data balanced` (it
+applies the next time privmsg connects). **When privmsg is closed it uses
+no data at all.** Every mode keeps the fake-packet stream running, so
+sending a message never makes a burst someone could spot; only the
+stream's speed changes. Each message fits in one network packet, so it
+leaves at the next tick of the stream.
 
-**Tor (on by default).** Without it, the first Nym server you connect to
+### Auto-sleep (off by default)
+
+`privmsg sleep 10` stops the fake-packet
+stream after 10 minutes without typing; you still receive messages, and the
+next key press starts it again (that takes a few seconds). While resting,
+privmsg uses well under 1 MB an hour per contact. The catch: someone
+watching your internet connection can then see *when* you're active, which
+the always-on stream hides. `privmsg sleep off` turns it off again. It never
+sleeps while decoys are on.
+
+### Tor (on by default)
+
+Without it, the first Nym server you connect to
 can see your IP address (not your messages, and not who you talk to). With
 Tor, privmsg reaches Nym through three Tor relays first, so the Nym servers
 only see a Tor address, your internet provider only sees that you use Tor,
 and each of your addresses goes through its own Tor circuit. No VPN needed.
 
 It costs a slower first start (Tor connects in 10–30 seconds; later starts
-are faster), a few MB a day for Tor to stay up to date while privmsg is
-open, and about 9 MB of disk. If Tor can't start, privmsg refuses to
-connect rather than quietly going without it. `privmsg tor off` turns it
+are faster), roughly double the internet data (see above), and about 9 MB
+of disk. If Tor can't start, privmsg refuses to connect rather than
+quietly going without it. `privmsg tor off` turns it
 off.
 
 Where Tor itself is blocked (for example China, Iran or Russia), it needs
@@ -349,10 +424,12 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 - **Identity:** no accounts or phone numbers. Contact nicknames never leave
   your device, and invite codes work only once.
 - **Data on disk:** encrypted with your passphrase.
-
 - **Linking your conversations:** each contact gets its own address, and
   addresses rotate weekly.
-- **When you write:** with decoys on, real messages are hidden among decoys.
+- **When you write:** the sender's constant fake-packet stream hides it
+  (unless you turn on auto-sleep); with decoys on, real messages are also
+  hidden among decoys at your contact's end.
+- **Old messages:** with disappearing messages on, both sides delete them.
 
 **Not protected ⚠️**
 - **Gateways working together (with Tor off):** all your addresses then
@@ -390,6 +467,8 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 | `Tor was not found` | Keep the `tor` folder from the download next to privmsg, or install Tor (`brew install tor`, `sudo apt install tor`). |
 | `Tor could not connect within 3 minutes` | Check your internet. If Tor is blocked where you are, use `privmsg tor off` for now. |
 | Mac: `"tor" can't be opened` or privmsg is "killed" | Run `xattr -dr com.apple.quarantine .` inside the privmsg folder. |
+| Linux: `GLIBC_2.39 not found` (or a similar version) | Your Linux is older than the system the download was built on. [Build it yourself](#build-it-yourself-mac-and-linux) instead; that always works. |
+| Your contact never gets your messages | Check that you both run v0.2.0. Older versions can't read newer messages. |
 
 ---
 
@@ -418,10 +497,12 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
   - [x] Decoy-traffic scheduler (Loopix-style constant-rate sending; no
         formal differential-privacy guarantee)
 - [x] **Lighter and more private**
-  - [x] Data modes: about 8 MB an hour per contact by default instead of 860
+  - [x] Data modes: about 9 MB an hour by default instead of 860 per contact
   - [x] Tor in front of Nym, so the Nym servers never see your IP (bundled)
   - [ ] Tor bridges for countries that block Tor
-  - [ ] One shared connection for all contacts (less data with many contacts)
+  - [x] One sender for all contacts, receive-only mailboxes per contact
+  - [x] One packet per message (faster delivery, less data)
+  - [x] Disappearing messages (both sides), optional auto-sleep
   - [ ] "Lite" mode over Tor onion services only
 
 Ideas and bug reports are welcome. Please open an issue.
@@ -435,21 +516,20 @@ Ideas and bug reports are welcome. Please open an issue.
 ```
 crates/
   crypto/      Layer 1: MLS via OpenMLS (identities, groups, persistence)
-  transport/   Layer 2: Nym clients per slot, multiplexer, padding, test network
+  transport/   Layer 2: Nym clients (one sender + one mailbox per slot),
+               multiplexer, padding, Tor child process, test network
   node/        The privmsg app: profile, wire format, invites, rotation,
                decoys (library), plus the CLI and terminal UI (binary)
 vendor/        nym-gateway-client with one patch: connect through Tor
 scripts/       install scripts; fetch-tor.sh (pinned, checksummed Tor)
 fuzz/          cargo-fuzz targets for everything read from the network
-docs/
-  ARCHITECTURE.md   Design, wire format, threat model
 .github/workflows/  CI (fmt, clippy, tests) and release builds
 ```
 
 **Build and test**
 
 ```bash
-cargo test --workspace          # 63 tests, no network needed
+cargo test --workspace          # 70 tests, no network needed
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```

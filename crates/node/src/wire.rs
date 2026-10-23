@@ -4,7 +4,7 @@
 //! transport frame (padded, Sphinx-wrapped by Nym)
 //!   └─ Envelope::Join { welcome, hello }   first contact
 //!      Envelope::Mls(ciphertext)           everything after
-//!         └─ MLS-encrypted Payload::Hello / Text / Rotate / RotateAck
+//!         └─ MLS-encrypted Payload::Hello / Text / Rotate / RotateAck / Timer
 //!      Envelope::Decoy(random)             cover, discarded on arrival
 //! ```
 //!
@@ -102,6 +102,11 @@ pub enum Payload {
     /// Sent to our new address on receiving a `Rotate`, so the old one can
     /// be retired.
     RotateAck,
+    /// "Delete our messages once they are this many seconds old" (`None` =
+    /// keep them). Both sides apply it to the whole conversation.
+    Timer {
+        after: Option<u64>,
+    },
 }
 
 /// Plausibility check for a mix address received from a peer. The transport

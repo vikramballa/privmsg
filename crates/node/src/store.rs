@@ -5,7 +5,7 @@
 //! `state.enc`, sealed with a key derived from the user's passphrase:
 //!
 //! ```text
-//! "PRIVMSG3" | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
+//! "PRIVMSG4" | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
 //! ```
 //!
 //! The key is Argon2id(passphrase, salt). The header is bound as AEAD
@@ -16,7 +16,8 @@
 //! upgraded on open: their single Nym client moves to the slot
 //! [`LEGACY_SLOT`], and every contact is due for an address rotation.
 //! Version 2 profiles (`"PRIVMSG2"`) only lack the network settings and get
-//! the defaults.
+//! the defaults. Version 3 profiles (`"PRIVMSG3"`) lack disappearing
+//! messages and auto-sleep, which start off.
 //!
 //! Not covered: the Nym clients' own files under `slots/` (their keys and
 //! gateway registrations) are written by the Nym SDK and are not encrypted
@@ -35,7 +36,8 @@ use privmsg_transport::DataMode;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"PRIVMSG3";
+const MAGIC: &[u8; 8] = b"PRIVMSG4";
+const MAGIC_V3: &[u8; 8] = b"PRIVMSG3";
 const MAGIC_V2: &[u8; 8] = b"PRIVMSG2";
 const MAGIC_V1: &[u8; 8] = b"PRIVMSG1";
 const SALT_LEN: usize = 16;
@@ -72,10 +74,13 @@ pub struct Settings {
     /// Mean seconds between decoy-or-real sends per conversation while
     /// connected. `None` = decoys off, messages go out immediately.
     pub decoy_interval: Option<u32>,
-    /// How much cover traffic each open address sends.
+    /// How much cover traffic is sent.
     pub data_mode: DataMode,
     /// Reach the Nym gateways through Tor, so they never see our IP.
     pub tor: bool,
+    /// Minutes without typing after which the app stops the sender and its
+    /// cover traffic. `None` = always on, which hides when you are active.
+    pub auto_sleep: Option<u32>,
 }
 
 impl Default for Settings {
@@ -84,6 +89,7 @@ impl Default for Settings {
             decoy_interval: None,
             data_mode: DataMode::default(),
             tor: true,
+            auto_sleep: None,
         }
     }
 }
@@ -115,6 +121,8 @@ pub struct Contact {
     pub history: Vec<HistoryEntry>,
     /// Incoming messages not yet shown in `chat`, `ui` or `history`.
     pub unread: u32,
+    /// Messages older than this many seconds are deleted, on both sides.
+    pub disappear_after: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -151,14 +159,81 @@ pub struct PendingInvite {
     pub slot: Slot,
 }
 
-/// The version 2 state layout: the same, with only decoys in the settings.
+/// The version 3 state layout: no disappearing messages, no auto-sleep.
+mod v3 {
+    use privmsg_transport::DataMode;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct State {
+        pub identity: Vec<u8>,
+        pub contacts: Vec<Contact>,
+        pub invites: Vec<super::PendingInvite>,
+        pub pending: Vec<super::PendingMessage>,
+        pub settings: Settings,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Settings {
+        pub decoy_interval: Option<u32>,
+        pub data_mode: DataMode,
+        pub tor: bool,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Contact {
+        pub name: String,
+        pub group_id: Vec<u8>,
+        pub address: String,
+        pub slot: super::Slot,
+        pub old_slots: Vec<super::OldSlot>,
+        pub rotated_at: u64,
+        pub history: Vec<super::HistoryEntry>,
+        pub unread: u32,
+    }
+}
+
+impl From<v3::Contact> for Contact {
+    fn from(c: v3::Contact) -> Self {
+        Contact {
+            name: c.name,
+            group_id: c.group_id,
+            address: c.address,
+            slot: c.slot,
+            old_slots: c.old_slots,
+            rotated_at: c.rotated_at,
+            history: c.history,
+            unread: c.unread,
+            disappear_after: None,
+        }
+    }
+}
+
+impl From<v3::State> for State {
+    fn from(old: v3::State) -> Self {
+        State {
+            identity: old.identity,
+            contacts: old.contacts.into_iter().map(Contact::from).collect(),
+            invites: old.invites,
+            pending: old.pending,
+            settings: Settings {
+                decoy_interval: old.settings.decoy_interval,
+                data_mode: old.settings.data_mode,
+                tor: old.settings.tor,
+                ..Settings::default()
+            },
+        }
+    }
+}
+
+/// The version 2 state layout: version 3's, with only decoys in the settings.
 mod v2 {
     use serde::Deserialize;
 
     #[derive(Deserialize)]
     pub struct State {
         pub identity: Vec<u8>,
-        pub contacts: Vec<super::Contact>,
+        pub contacts: Vec<super::v3::Contact>,
         pub invites: Vec<super::PendingInvite>,
         pub pending: Vec<super::PendingMessage>,
         pub decoy_interval: Option<u32>,
@@ -169,7 +244,7 @@ impl From<v2::State> for State {
     fn from(old: v2::State) -> Self {
         State {
             identity: old.identity,
-            contacts: old.contacts,
+            contacts: old.contacts.into_iter().map(Contact::from).collect(),
             invites: old.invites,
             pending: old.pending,
             settings: Settings {
@@ -228,6 +303,7 @@ impl From<v1::State> for State {
                     rotated_at: 0,
                     history: c.history,
                     unread: 0,
+                    disappear_after: None,
                 })
                 .collect(),
             invites: old
@@ -294,8 +370,9 @@ impl Profile {
         let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let version_1 = data.starts_with(MAGIC_V1);
         let version_2 = data.starts_with(MAGIC_V2);
+        let version_3 = data.starts_with(MAGIC_V3);
         if data.len() < HEADER_LEN + NONCE_LEN
-            || !(data.starts_with(MAGIC) || version_2 || version_1)
+            || !(data.starts_with(MAGIC) || version_3 || version_2 || version_1)
         {
             bail!("{} is not a privmsg profile", path.display());
         }
@@ -320,12 +397,20 @@ impl Profile {
             key,
             _lock: lock,
         };
-        if version_2 {
-            let old: v2::State =
-                bincode::deserialize(&plaintext).context("decode profile state")?;
-            let state = State::from(old);
+        if version_2 || version_3 {
+            let state = if version_3 {
+                State::from(
+                    bincode::deserialize::<v3::State>(&plaintext)
+                        .context("decode profile state")?,
+                )
+            } else {
+                State::from(
+                    bincode::deserialize::<v2::State>(&plaintext)
+                        .context("decode profile state")?,
+                )
+            };
             profile.save(&state)?;
-            tracing::info!("upgraded profile to version 3");
+            tracing::info!("upgraded profile to version 4");
             return Ok((profile, state));
         }
         if !version_1 {
@@ -344,7 +429,7 @@ impl Profile {
         }
         let state = State::from(old);
         profile.save(&state)?;
-        tracing::info!("upgraded profile to version 2");
+        tracing::info!("upgraded profile to version 4");
         Ok((profile, state))
     }
 
@@ -476,11 +561,41 @@ mod tests {
                     at: 1,
                 }],
                 unread: 0,
+                disappear_after: Some(3600),
             }],
             invites: vec![],
             pending: vec![],
             settings: Settings::default(),
         }
+    }
+
+    /// The version 3 encoding of a contact: everything but the timer.
+    #[derive(Serialize)]
+    struct ContactV3 {
+        name: String,
+        group_id: Vec<u8>,
+        address: String,
+        slot: Slot,
+        old_slots: Vec<OldSlot>,
+        rotated_at: u64,
+        history: Vec<HistoryEntry>,
+        unread: u32,
+    }
+
+    fn v3_contacts(contacts: Vec<Contact>) -> Vec<ContactV3> {
+        contacts
+            .into_iter()
+            .map(|c| ContactV3 {
+                name: c.name,
+                group_id: c.group_id,
+                address: c.address,
+                slot: c.slot,
+                old_slots: c.old_slots,
+                rotated_at: c.rotated_at,
+                history: c.history,
+                unread: c.unread,
+            })
+            .collect()
     }
 
     /// Write `state` the way version 1 did.
@@ -564,7 +679,7 @@ mod tests {
         #[derive(Serialize)]
         struct V2 {
             identity: Vec<u8>,
-            contacts: Vec<Contact>,
+            contacts: Vec<ContactV3>,
             invites: Vec<PendingInvite>,
             pending: Vec<PendingMessage>,
             decoy_interval: Option<u32>,
@@ -572,7 +687,7 @@ mod tests {
         let current = sample_state();
         let old = V2 {
             identity: current.identity,
-            contacts: current.contacts,
+            contacts: v3_contacts(current.contacts),
             invites: current.invites,
             pending: current.pending,
             decoy_interval: Some(30),
@@ -588,11 +703,55 @@ mod tests {
                 decoy_interval: Some(30),
                 data_mode: DataMode::Saver,
                 tor: true,
+                auto_sleep: None,
             }
         );
         drop(profile);
         let raw = fs::read(dir.path().join(STATE_FILE))?;
         assert!(raw.starts_with(MAGIC), "rewritten as the current version");
+        Ok(())
+    }
+
+    #[test]
+    fn version_3_profile_keeps_settings_and_starts_without_timers() -> Result<()> {
+        #[derive(Serialize)]
+        struct V3 {
+            identity: Vec<u8>,
+            contacts: Vec<ContactV3>,
+            invites: Vec<PendingInvite>,
+            pending: Vec<PendingMessage>,
+            settings: (Option<u32>, DataMode, bool),
+        }
+        let current = sample_state();
+        let old = V3 {
+            identity: current.identity,
+            contacts: v3_contacts(current.contacts),
+            invites: current.invites,
+            pending: current.pending,
+            settings: (Some(30), DataMode::Balanced, false),
+        };
+        let dir = tempfile::tempdir()?;
+        write_old(MAGIC_V3, dir.path(), "pw", &bincode::serialize(&old)?)?;
+
+        let (profile, state) = Profile::open(dir.path(), "pw")?;
+        assert_eq!(state.contacts[0].history[0].text, "hi");
+        assert_eq!(state.contacts[0].disappear_after, None);
+        assert_eq!(
+            state.settings,
+            Settings {
+                decoy_interval: Some(30),
+                data_mode: DataMode::Balanced,
+                tor: false,
+                auto_sleep: None,
+            }
+        );
+        drop(profile);
+        let raw = fs::read(dir.path().join(STATE_FILE))?;
+        assert!(raw.starts_with(MAGIC), "rewritten as the current version");
+        assert_eq!(
+            Profile::open(dir.path(), "pw")?.1.settings.data_mode,
+            DataMode::Balanced
+        );
         Ok(())
     }
 

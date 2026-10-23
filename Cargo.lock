@@ -5976,7 +5976,7 @@ dependencies = [
 
 [[package]]
 name = "privmsg-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -5990,7 +5990,7 @@ dependencies = [
 
 [[package]]
 name = "privmsg-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6016,13 +6016,16 @@ dependencies = [
 
 [[package]]
 name = "privmsg-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "futures",
  "nym-gateway-client",
  "nym-http-api-client",
  "nym-sdk",
+ "nym-sphinx",
+ "rand 0.8.8",
  "reqwest 0.13.5",
  "serde",
  "tempfile",

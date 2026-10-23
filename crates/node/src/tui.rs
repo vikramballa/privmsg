@@ -6,6 +6,11 @@
 //! Making contact is guided: Ctrl-N asks for a name and copies a fresh
 //! invite to the clipboard; Ctrl-O takes a pasted invite code and asks what
 //! to call its sender. (`/invite <name>` and `/add <name> <code>` still work.)
+//! Ctrl-D steps the selected conversation's disappearing-message timer
+//! through off, 5 minutes, 1 hour, 1 day and 1 week (or `/disappear 1h`).
+//!
+//! With auto-sleep on, the sender (and its cover traffic) stops after the
+//! set minutes without typing and comes back on the next key press.
 
 use std::time::Duration;
 
@@ -15,7 +20,7 @@ use crossterm::event::{
     KeyEventKind, KeyModifiers,
 };
 use futures::StreamExt;
-use privmsg_node::app::{Event, Node};
+use privmsg_node::app::{describe_timer, next_timer, parse_timer, Event, Node};
 use privmsg_node::decoy::Scheduler;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
@@ -26,8 +31,8 @@ use tokio::time::Instant;
 
 use crate::{clean, connect, far_future, flush_queued, tick, utc, Network, MAINTENANCE_EVERY};
 
-const HELP: &str =
-    "Ctrl-N invite a friend · Ctrl-O enter an invite code · ↑↓ switch chat · Esc quit";
+const HELP: &str = "Ctrl-N invite a friend · Ctrl-O enter an invite code · \
+                    Ctrl-D disappearing messages · ↑↓ switch chat · Esc quit";
 
 /// What the input line is for right now.
 #[derive(Default, Clone, PartialEq, Debug)]
@@ -62,6 +67,8 @@ enum Action {
     None,
     Quit,
     Move(isize),
+    /// Step the selected conversation's disappearing-message timer.
+    Timer,
     /// Enter pressed in the given mode, with the trimmed input.
     Submit(Mode, String),
 }
@@ -92,6 +99,7 @@ impl App {
                 self.status =
                     "Paste the invite code you were sent, then press Enter. Esc cancels.".into();
             }
+            KeyCode::Char('d') if ctrl && self.mode == Mode::Chat => return Action::Timer,
             KeyCode::Up if self.mode == Mode::Chat => return Action::Move(-1),
             KeyCode::Down | KeyCode::Tab if self.mode == Mode::Chat => return Action::Move(1),
             KeyCode::Backspace => {
@@ -179,30 +187,44 @@ async fn event_loop(
     let mut keys = EventStream::new();
     let mut maintenance =
         tokio::time::interval_at(Instant::now() + MAINTENANCE_EVERY, MAINTENANCE_EVERY);
+    let mut last_typed = Instant::now();
     loop {
         if let Some(name) = selected_name(node, &app) {
             node.mark_read(&name)?;
         }
-        terminal.draw(|f| draw(f, node, &app, scheduler.as_ref()))?;
+        terminal.draw(|f| draw(f, node, &app, scheduler.as_ref(), mux.is_awake()))?;
 
         let next_tick = scheduler.as_ref().and_then(Scheduler::next_due);
         let tick_at = next_tick.as_ref().map_or_else(far_future, |(_, at)| *at);
+        // Decoys keep sending by design, so they keep the sender up.
+        let idle_limit = node
+            .settings()
+            .auto_sleep
+            .filter(|_| scheduler.is_none())
+            .map(|mins| Duration::from_secs(u64::from(mins) * 60));
+        let sleep_at = idle_limit.map_or_else(far_future, |limit| last_typed + limit);
         tokio::select! {
             msg = mux.recv() => {
                 let (slot, msg) = msg?;
                 match node.handle_incoming(mux, &slot, &msg.payload).await {
                     Ok(events) => {
                         for event in events {
-                            if let Event::Joined { contact } = event {
-                                app.status = format!("✓ {} joined. Say hi!", clean(&contact));
-                                if app.mode == Mode::Chat {
-                                    // The invite on screen has done its job.
-                                    app.notice = None;
-                                    select(node, &mut app, &contact);
+                            match event {
+                                Event::Joined { contact } => {
+                                    app.status = format!("✓ {} joined. Say hi!", clean(&contact));
+                                    if app.mode == Mode::Chat {
+                                        // The invite on screen has done its job.
+                                        app.notice = None;
+                                        select(node, &mut app, &contact);
+                                    }
+                                    if let Some(s) = scheduler.as_mut() {
+                                        s.add(contact);
+                                    }
                                 }
-                                if let Some(s) = scheduler.as_mut() {
-                                    s.add(contact);
+                                Event::Timer { contact, after } => {
+                                    app.status = timer_status(Some(&contact), &contact, after);
                                 }
+                                Event::Message { .. } => {}
                             }
                         }
                     }
@@ -211,20 +233,31 @@ async fn event_loop(
             }
             key = keys.next() => match key {
                 Some(Ok(TermEvent::Key(k))) if k.kind == KeyEventKind::Press => {
+                    last_typed = Instant::now();
                     // Windows reports AltGr (how many keyboards type @, € or
                     // {) as Ctrl+Alt; that is typing, not a shortcut.
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL)
                         && !k.modifiers.contains(KeyModifiers::ALT);
-                    match app.key(k.code, ctrl) {
+                    let action = app.key(k.code, ctrl);
+                    if action != Action::Quit && !mux.is_awake() && idle_limit.is_some()
+                        && !node.contacts().is_empty()
+                    {
+                        wake(terminal, node, mux, &mut app, scheduler.as_ref()).await?;
+                    }
+                    match action {
                         Action::None => {}
                         Action::Quit => return Ok(()),
                         Action::Move(step) => move_selection(node, &mut app, step),
+                        Action::Timer => step_timer(node, mux, &mut app).await,
                         Action::Submit(mode, line) => {
                             submit(node, mux, scheduler, &mut app, mode, &line).await
                         }
                     }
                 }
-                Some(Ok(TermEvent::Paste(text))) => app.paste(&text),
+                Some(Ok(TermEvent::Paste(text))) => {
+                    last_typed = Instant::now();
+                    app.paste(&text)
+                }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
@@ -239,8 +272,66 @@ async fn event_loop(
                     app.status = format!("address maintenance failed: {e:#}");
                 }
             }
+            _ = tokio::time::sleep_until(sleep_at), if idle_limit.is_some() && mux.is_awake() => {
+                mux.sleep().await;
+                app.status =
+                    "Resting to save data. You still get messages; typing wakes it up.".into();
+            }
         }
     }
+}
+
+/// Bring the sender back after auto-sleep, saying so while it connects.
+async fn wake(
+    terminal: &mut DefaultTerminal,
+    node: &Node,
+    mux: &mut Network,
+    app: &mut App,
+    scheduler: Option<&Scheduler>,
+) -> Result<()> {
+    let before = std::mem::replace(&mut app.status, "waking up (a few seconds)…".into());
+    terminal.draw(|f| draw(f, node, app, scheduler, false))?;
+    app.status = match mux.wake().await {
+        Ok(()) => before,
+        Err(e) => format!("✗ could not reconnect: {e:#}. It tries again when you send."),
+    };
+    Ok(())
+}
+
+/// Ctrl-D: the selected conversation's next disappearing-message timer.
+async fn step_timer(node: &mut Node, mux: &mut Network, app: &mut App) {
+    let Some(contact) = node.contacts().get(app.selected) else {
+        app.status = "Pick a conversation first.".into();
+        return;
+    };
+    let (name, after) = (contact.name.clone(), next_timer(contact.disappear_after));
+    set_timer(node, mux, app, &name, after).await;
+}
+
+async fn set_timer(
+    node: &mut Node,
+    mux: &mut Network,
+    app: &mut App,
+    name: &str,
+    after: Option<u64>,
+) {
+    app.status = match node.set_timer(mux, name, after).await {
+        Ok(()) => timer_status(None, name, after),
+        Err(e) => format!("✗ could not change disappearing messages: {e:#}"),
+    };
+}
+
+/// What changed, by `by` (the contact) or by us when `None`.
+fn timer_status(by: Option<&str>, name: &str, after: Option<u64>) -> String {
+    let who = by.map_or("You".to_string(), clean);
+    let what = match after {
+        None => "turned disappearing messages off".to_string(),
+        Some(_) => format!("set messages to disappear after {}", describe_timer(after)),
+    };
+    format!(
+        "{who} {what} in the chat with {}, on both sides. (Ctrl-D changes it)",
+        clean(name)
+    )
 }
 
 /// Act on a line entered in `mode`.
@@ -260,6 +351,11 @@ async fn submit(
         (_, ["/add", name, code @ ..]) if !code.is_empty() => {
             add(node, mux, scheduler, app, &code.concat(), name).await
         }
+        (_, ["/disappear", word]) => match (parse_timer(word), selected_name(node, app)) {
+            (Ok(after), Some(name)) => set_timer(node, mux, app, &name, after).await,
+            (Err(e), _) => app.status = format!("{e:#}"),
+            (_, None) => app.status = "Pick a conversation first.".into(),
+        },
         (_, [cmd, ..]) if cmd.starts_with('/') => app.status = HELP.into(),
         (_, []) => {}
         _ => {
@@ -465,7 +561,7 @@ fn move_selection(node: &Node, app: &mut App, step: isize) {
     }
 }
 
-fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>) {
+fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>, awake: bool) {
     let [main, input_area, status_area] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(3),
@@ -508,7 +604,14 @@ fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>) {
     );
 
     let selected = node.contacts().get(app.selected);
-    let title = selected.map_or(" privmsg ".to_string(), |c| format!(" {} ", clean(&c.name)));
+    let title = selected.map_or(" privmsg ".to_string(), |c| match c.disappear_after {
+        None => format!(" {} ", clean(&c.name)),
+        Some(_) => format!(
+            " {} · messages disappear after {} ",
+            clean(&c.name),
+            describe_timer(c.disappear_after)
+        ),
+    });
     let block = Block::bordered().title(title);
     let body = if let Some(notice) = &app.notice {
         Paragraph::new(notice.as_str())
@@ -566,7 +669,12 @@ fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>) {
     }
     let settings = node.settings();
     let tor = if settings.tor { "Tor on" } else { "Tor off" };
-    let network = format!(" {tor} · data: {} ", settings.data_mode.name());
+    let resting = if settings.auto_sleep.is_some() && !awake {
+        " · resting"
+    } else {
+        ""
+    };
+    let network = format!(" {tor} · data: {}{resting} ", settings.data_mode.name());
     let [status_area, network_area] = Layout::horizontal([
         Constraint::Min(10),
         Constraint::Length(network.len() as u16),
@@ -629,6 +737,15 @@ mod tests {
             app.key(KeyCode::Enter, false),
             Action::Submit(Mode::CodeName { code }, "bob".into())
         );
+    }
+
+    #[test]
+    fn ctrl_d_steps_the_timer_only_while_chatting() {
+        let mut app = App::default();
+        assert_eq!(app.key(KeyCode::Char('d'), true), Action::Timer);
+        app.key(KeyCode::Char('n'), true);
+        assert_eq!(app.key(KeyCode::Char('d'), true), Action::None);
+        assert_eq!(app.input, "", "not typed either");
     }
 
     #[test]

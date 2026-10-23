@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use privmsg_crypto::{Identity, Session};
-use privmsg_node::app::{Event, Node};
+use privmsg_node::app::{describe_timer, parse_timer, Event, Node};
 use privmsg_node::decoy::{self, Scheduler};
 use privmsg_node::store::{HistoryEntry, Profile, Settings};
 use privmsg_transport::{DataMode, Mux, NymNetwork, Tor};
@@ -52,6 +52,8 @@ commands:
   listen [seconds]        receive messages until Ctrl-C (or for <seconds>)
   contacts                list contacts, unread counts and open invites
   history <name>          show saved messages with <name>
+  disappear <name> [off|5m|1h|1d|1w]
+                          show or set disappearing messages with <name> (both sides)
   rotate <name>           move the conversation with <name> to a new address
   remove <name>           forget a contact or unused invite and its addresses
   address                 show your mix address for each contact
@@ -59,6 +61,8 @@ commands:
   data [saver|balanced|maximum]
                           show or set how much internet data privmsg uses
   tor [on|off]            show or set hiding your IP address with Tor (default on)
+  sleep [off|<minutes>]   show or set auto-sleep: the app stops its cover traffic
+                          after <minutes> without typing (default off)
   keychain save|forget    keep the passphrase in the macOS keychain, or stop
   selftest                offline check of the encryption layer
 
@@ -125,6 +129,8 @@ async fn main() -> Result<()> {
         ["chat", name] => session(data_dir, Some(name), None).await,
         [] | ["ui"] => start(data_dir).await,
         ["history", name] => history(data_dir, name),
+        ["disappear", name] => disappear(data_dir, name, None).await,
+        ["disappear", name, after] => disappear(data_dir, name, Some(after)).await,
         ["rotate", name] => rotate(data_dir, name).await,
         ["remove", name] => remove(data_dir, name).await,
         ["decoys"] => decoys(data_dir, None),
@@ -133,6 +139,8 @@ async fn main() -> Result<()> {
         ["data", mode] => data_mode(data_dir, Some(mode)),
         ["tor"] => tor(data_dir, None),
         ["tor", setting] => tor(data_dir, Some(setting)),
+        ["sleep"] => auto_sleep(data_dir, None),
+        ["sleep", setting] => auto_sleep(data_dir, Some(setting)),
         ["keychain", "save"] => keychain_save(data_dir),
         ["keychain", "forget"] => keychain_forget(data_dir),
         ["help"] | ["-h"] | ["--help"] => {
@@ -412,6 +420,26 @@ async fn send(dir: PathBuf, name: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+async fn disappear(dir: PathBuf, name: &str, after: Option<&str>) -> Result<()> {
+    let mut node = open(&dir)?;
+    if let Some(after) = after {
+        let after = parse_timer(after)?;
+        // Only the sender is needed; nothing has to be received.
+        let mut mux = connect(&mut node, &[]).await?;
+        let result = node.set_timer(&mut mux, name, after).await;
+        mux.close().await;
+        result?;
+    }
+    match node.contact(name)?.disappear_after {
+        None => println!("disappearing messages with {name}: off"),
+        Some(secs) => println!(
+            "messages with {name} disappear after {} — here and in {name}'s app",
+            describe_timer(Some(secs))
+        ),
+    }
+    Ok(())
+}
+
 async fn rotate(dir: PathBuf, name: &str) -> Result<()> {
     let mut node = open(&dir)?;
     let slots = node.slots_for(name)?;
@@ -478,12 +506,45 @@ fn data_mode(dir: PathBuf, setting: Option<&str>) -> Result<()> {
             DataMode::Maximum => "instant, the most cover; heavy on data",
         };
         println!(
-            "{mark} {:<9} ~{} MB an hour per contact while open; {about}",
+            "{mark} {:<9} ~{} MB an hour, plus ~{} per contact, while open; {about}",
             mode.name(),
-            mode.mb_per_hour()
+            mode.mb_per_hour(),
+            mode.slot_mb_per_hour()
         );
     }
     println!("Nothing is used while privmsg is closed. Changes apply the next time it connects.");
+    Ok(())
+}
+
+fn auto_sleep(dir: PathBuf, setting: Option<&str>) -> Result<()> {
+    let mut node = open(&dir)?;
+    if let Some(setting) = setting {
+        let auto_sleep = match setting {
+            "off" => None,
+            mins => match mins.parse::<u32>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => bail!("use `off` or a number of minutes, like `privmsg sleep 10`"),
+            },
+        };
+        node.set_settings(Settings {
+            auto_sleep,
+            ..node.settings().clone()
+        })?;
+    }
+    match node.settings().auto_sleep {
+        None => println!(
+            "auto-sleep off: while the app is open its cover traffic never stops, so \
+             nobody watching your connection can tell when you are actually chatting"
+        ),
+        Some(n) => println!(
+            "auto-sleep on: after {n} minutes without typing the app stops its cover traffic \
+             (you still receive messages) and starts it again when you type. Saves data, but \
+             someone watching your connection can see when you are active."
+        ),
+    }
+    if node.settings().decoy_interval.is_some() {
+        println!("(decoys are on, which keeps the app sending, so it never sleeps)");
+    }
     Ok(())
 }
 
@@ -685,6 +746,11 @@ async fn receive(
                             tracing::warn!("{e:#}");
                         }
                     }
+                    Event::Timer { contact, after } => println!(
+                        "* {} set disappearing messages to {}",
+                        clean(&contact),
+                        describe_timer(after)
+                    ),
                 }
             }
         }

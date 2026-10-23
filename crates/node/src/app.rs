@@ -68,10 +68,73 @@ pub const RETIRE_GRACE: u64 = 24 * 3600;
 /// the current session, so its gateway has handed over anything it stored.
 const DRAIN_TIME: Duration = Duration::from_secs(60);
 
+/// Disappearing-message timers offered to the user, in seconds, with the
+/// words used for each.
+pub const TIMERS: [(u64, &str); 4] = [
+    (5 * 60, "5m"),
+    (3600, "1h"),
+    (24 * 3600, "1d"),
+    (7 * 24 * 3600, "1w"),
+];
+
+/// Bounds on a timer set by the contact.
+const TIMER_RANGE: std::ops::RangeInclusive<u64> = 60..=365 * 24 * 3600;
+
+/// `"off"` or one of [`TIMERS`]' words.
+pub fn parse_timer(word: &str) -> Result<Option<u64>> {
+    if word == "off" {
+        return Ok(None);
+    }
+    TIMERS
+        .iter()
+        .find(|(_, w)| *w == word)
+        .map(|(secs, _)| Some(*secs))
+        .ok_or_else(|| anyhow!("use off, 5m, 1h, 1d or 1w"))
+}
+
+/// A timer in words, for the user.
+pub fn describe_timer(after: Option<u64>) -> String {
+    let Some(secs) = after else {
+        return "off".into();
+    };
+    match secs {
+        s if s % (7 * 24 * 3600) == 0 => plural(s / (7 * 24 * 3600), "week"),
+        s if s % (24 * 3600) == 0 => plural(s / (24 * 3600), "day"),
+        s if s % 3600 == 0 => plural(s / 3600, "hour"),
+        s => plural(s.div_ceil(60), "minute"),
+    }
+}
+
+fn plural(n: u64, unit: &str) -> String {
+    if n == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{n} {unit}s")
+    }
+}
+
+/// The timer after `current` in [`TIMERS`], wrapping round through off.
+pub fn next_timer(current: Option<u64>) -> Option<u64> {
+    match current {
+        None => Some(TIMERS[0].0),
+        Some(secs) => TIMERS.iter().map(|(s, _)| *s).find(|s| *s > secs),
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Event {
-    Joined { contact: String },
-    Message { contact: String, text: String },
+    Joined {
+        contact: String,
+    },
+    Message {
+        contact: String,
+        text: String,
+    },
+    /// The contact changed the conversation's disappearing-message timer.
+    Timer {
+        contact: String,
+        after: Option<u64>,
+    },
 }
 
 pub struct Node {
@@ -107,7 +170,9 @@ impl Node {
                 .with_context(|| format!("reopen conversation with {}", contact.name))?;
             sessions.insert(contact.group_id.clone(), session);
         }
-        Ok(Self::assemble(profile, state, identity, sessions))
+        let mut node = Self::assemble(profile, state, identity, sessions);
+        node.expire()?;
+        Ok(node)
     }
 
     fn assemble(
@@ -252,8 +317,7 @@ impl Node {
             };
             let hello = session.encrypt(&self.identity, &encode(&hello)?)?;
             let frame = encode(&Envelope::Join { welcome, hello })?;
-            mux.send(&slot.id, &MixAddress(invite.address.clone()), &frame)
-                .await
+            mux.send(&MixAddress(invite.address.clone()), &frame).await
         }
         .await;
         if let Err(e) = sent {
@@ -287,17 +351,51 @@ impl Node {
     /// Send a decoy to `name`: on the wire it looks like a short message;
     /// the receiver discards it.
     pub async fn send_decoy<N: Network>(&mut self, mux: &mut Mux<N>, name: &str) -> Result<()> {
-        let contact = self.contact(name)?;
-        let (slot, to) = (contact.slot.id.clone(), MixAddress(contact.address.clone()));
-        if !mux.is_open(&slot) {
-            self.connect(mux, std::slice::from_ref(&slot)).await?;
-        }
+        let to = MixAddress(self.contact(name)?.address.clone());
         // Real short messages are a few hundred bytes of MLS ciphertext; any
         // length up to one padding block costs the same on the wire.
         let mut filler = vec![0u8; 64 + (OsRng.next_u32() % 960) as usize];
         OsRng.fill_bytes(&mut filler);
-        mux.send(&slot, &to, &encode(&Envelope::Decoy(filler))?)
-            .await
+        mux.send(&to, &encode(&Envelope::Decoy(filler))?).await
+    }
+
+    /// Set how long messages with `name` live, here and (by telling them)
+    /// on their side. Messages already older than that go at once.
+    pub async fn set_timer<N: Network>(
+        &mut self,
+        mux: &mut Mux<N>,
+        name: &str,
+        after: Option<u64>,
+    ) -> Result<()> {
+        let idx = self.index(name)?;
+        let group_id = self.state.contacts[idx].group_id.clone();
+        self.send_payload(mux, &group_id, &Payload::Timer { after })
+            .await?;
+        self.state.contacts[idx].disappear_after = after;
+        self.expire()?;
+        self.save()
+    }
+
+    /// Delete messages that have outlived their conversation's timer.
+    pub fn expire(&mut self) -> Result<()> {
+        let now = unix_now();
+        let mut changed = false;
+        for contact in &mut self.state.contacts {
+            let Some(after) = contact.disappear_after else {
+                continue;
+            };
+            let before = contact.history.len();
+            contact.history.retain(|e| e.at.saturating_add(after) > now);
+            if contact.history.len() != before {
+                changed = true;
+                let incoming = contact.history.iter().filter(|e| !e.outgoing).count();
+                contact.unread = contact.unread.min(incoming as u32);
+            }
+        }
+        if changed {
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// Replace the address `name` writes to us at. The old one keeps
@@ -332,11 +430,13 @@ impl Node {
             .await
     }
 
-    /// Housekeeping, to run now and then while connected: retire old
-    /// addresses that are drained and confirmed, re-send unconfirmed
-    /// rotations once per session, and rotate addresses that are due.
+    /// Housekeeping, to run now and then while connected: delete expired
+    /// messages, retire old addresses that are drained and confirmed,
+    /// re-send unconfirmed rotations once per session, and rotate addresses
+    /// that are due.
     /// Only conversations whose current address is open are touched.
     pub async fn maintain<N: Network>(&mut self, mux: &mut Mux<N>) -> Result<()> {
+        self.expire()?;
         let now = unix_now();
         for idx in 0..self.state.contacts.len() {
             let drained: Vec<String> = self.state.contacts[idx]
@@ -510,6 +610,9 @@ impl Node {
         // The ratchet may have moved even if the message was then refused.
         self.save()?;
         let (event, ack) = received?;
+        if let Some(Event::Timer { .. }) = event {
+            self.expire()?;
+        }
         if ack {
             if let Err(e) = self.send_payload(mux, &group_id, &Payload::RotateAck).await {
                 tracing::warn!("could not confirm an address change: {e:#}");
@@ -571,13 +674,19 @@ impl Node {
                 Ok((None, true))
             }
             Payload::Rotate { .. } => bail!("refused an address change to an invalid address"),
+            Payload::Timer { after } if after.is_none_or(|s| TIMER_RANGE.contains(&s)) => {
+                contact.disappear_after = after;
+                let contact = contact.name.clone();
+                Ok((Some(Event::Timer { contact, after }), false))
+            }
+            Payload::Timer { .. } => bail!("refused an out-of-range disappearing timer"),
             // A repeated Hello carries nothing new; an ack did its work above.
             Payload::Hello { .. } | Payload::RotateAck => Ok((None, false)),
         }
     }
 
-    /// Encrypt `payload` for the conversation `group_id` and send it from
-    /// our current address for it. Saves either way: the ratchet advanced.
+    /// Encrypt `payload` for the conversation `group_id` and send it to the
+    /// contact. Saves either way: the ratchet advanced.
     async fn send_payload<N: Network>(
         &mut self,
         mux: &mut Mux<N>,
@@ -590,18 +699,13 @@ impl Node {
             .iter()
             .find(|c| c.group_id == group_id)
             .ok_or_else(|| anyhow!("unknown conversation"))?;
-        let (slot, to) = (contact.slot.id.clone(), MixAddress(contact.address.clone()));
-        if !mux.is_open(&slot) {
-            self.connect(mux, std::slice::from_ref(&slot)).await?;
-        }
+        let to = MixAddress(contact.address.clone());
         let session = self
             .sessions
             .get_mut(group_id)
             .ok_or_else(|| anyhow!("conversation state is missing"))?;
         let ciphertext = session.encrypt(&self.identity, &encode(payload)?)?;
-        let sent = mux
-            .send(&slot, &to, &encode(&Envelope::Mls(ciphertext))?)
-            .await;
+        let sent = mux.send(&to, &encode(&Envelope::Mls(ciphertext))?).await;
         self.save()?;
         sent
     }
@@ -683,6 +787,7 @@ impl Node {
             rotated_at: unix_now(),
             history: Vec::new(),
             unread: 0,
+            disappear_after: None,
         });
         self.sessions.insert(group_id, session);
     }
@@ -856,6 +961,94 @@ mod tests {
         assert_eq!(bob.node.contact("alice")?.unread, 1);
         bob.node.mark_read("alice")?;
         assert_eq!(bob.reopen()?.node.contact("alice")?.unread, 0);
+        Ok(())
+    }
+
+    /// Pretend every message with `name` was sent `secs` ago.
+    fn age(peer: &mut Peer, name: &str, secs: u64) {
+        let idx = peer.node.index(name).unwrap();
+        for entry in &mut peer.node.state.contacts[idx].history {
+            entry.at -= secs;
+        }
+    }
+
+    #[tokio::test]
+    async fn disappearing_timer_applies_on_both_sides() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "old news").await?;
+        bob.recv().await?;
+        age(&mut alice, "bob", 2 * 3600);
+        age(&mut bob, "alice", 2 * 3600);
+        alice.send("bob", "fresh").await?;
+        bob.recv().await?;
+
+        alice
+            .node
+            .set_timer(&mut alice.mux, "bob", Some(3600))
+            .await?;
+        let kept = |p: &Peer, name: &str| -> Vec<String> {
+            let history = &p.node.contact(name).unwrap().history;
+            history.iter().map(|e| e.text.clone()).collect()
+        };
+        assert_eq!(kept(&alice, "bob"), ["fresh"]);
+        assert_eq!(
+            bob.recv().await?,
+            vec![Event::Timer {
+                contact: "alice".into(),
+                after: Some(3600)
+            }]
+        );
+        assert_eq!(kept(&bob, "alice"), ["fresh"]);
+        assert_eq!(bob.node.contact("alice")?.unread, 1, "only what is left");
+
+        // Expired messages also go while the app is closed.
+        age(&mut bob, "alice", 2 * 3600);
+        bob.node.save()?;
+        let mut bob = bob.reopen()?;
+        assert!(kept(&bob, "alice").is_empty());
+        assert_eq!(bob.node.contact("alice")?.unread, 0);
+
+        bob.node.set_timer(&mut bob.mux, "alice", None).await?;
+        alice.recv().await?;
+        assert_eq!(alice.node.contact("bob")?.disappear_after, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn out_of_range_timers_are_refused() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        let group_id = alice.node.contact("bob")?.group_id.clone();
+        alice
+            .node
+            .send_payload(
+                &mut alice.mux,
+                &group_id,
+                &Payload::Timer { after: Some(1) },
+            )
+            .await?;
+        assert!(bob.recv().await.is_err());
+        assert_eq!(bob.node.contact("alice")?.disappear_after, None);
+        Ok(())
+    }
+
+    #[test]
+    fn timer_words() -> Result<()> {
+        assert_eq!(parse_timer("1h")?, Some(3600));
+        assert_eq!(parse_timer("off")?, None);
+        assert!(parse_timer("2h").is_err());
+        assert_eq!(describe_timer(Some(3600)), "1 hour");
+        assert_eq!(describe_timer(Some(14 * 24 * 3600)), "2 weeks");
+        assert_eq!(describe_timer(Some(90)), "2 minutes");
+        // Ctrl-D cycles off → 5m → 1h → 1d → 1w → off.
+        let mut t = None;
+        let mut seen = vec![];
+        for _ in 0..5 {
+            t = next_timer(t);
+            seen.push(describe_timer(t));
+        }
+        assert_eq!(seen, ["5 minutes", "1 hour", "1 day", "1 week", "off"]);
         Ok(())
     }
 
