@@ -6,8 +6,10 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege: only the publish job may write to the repository.
+# Actions are pinned to commit SHAs (tags can be moved to other code).
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,12 +39,16 @@ jobs:
             os: windows-latest
             tor: windows-x86_64
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # Signed build provenance: `gh attestation verify <file> -R vikramballa/privmsg`.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
+      # No build cache here: release binaries are built from scratch, so a
+      # cache written by another run can't end up in them.
       - run: cargo test --workspace --locked
         if: matrix.target != 'x86_64-apple-darwin'
       - run: cargo build --release --locked --target ${{ matrix.target }} -p privmsg-node
@@ -69,7 +75,12 @@ jobs:
             tar czf "$name.tar.gz" "$name"
             shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            privmsg-*.tar.gz
+            privmsg-*.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.target }}
           path: |
@@ -79,11 +90,13 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           prerelease: true
           generate_release_notes: true

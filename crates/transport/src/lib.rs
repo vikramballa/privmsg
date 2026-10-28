@@ -48,6 +48,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "embedded-tor")]
+mod embedded_tor;
 #[cfg(feature = "nym")]
 mod nym;
 mod private_dir;
@@ -230,6 +232,23 @@ impl<N: Network> Mux<N> {
     pub async fn close(self) {
         let endpoints = self.open.into_iter().map(|(_, e)| e).chain(self.sender);
         futures::future::join_all(endpoints.map(Transport::close)).await;
+    }
+
+    /// Close every connection but keep the network (and its Tor), for when
+    /// the connections may have died: the device changed networks, or was
+    /// asleep. [`open`](Self::open) brings slots back on the same addresses.
+    /// Connections that don't close within `timeout` are dropped.
+    pub async fn reset(&mut self, timeout: Duration) {
+        let endpoints: Vec<N::Endpoint> = self
+            .open
+            .drain(..)
+            .map(|(_, e)| e)
+            .chain(self.sender.take())
+            .collect();
+        let closing = futures::future::join_all(endpoints.into_iter().map(Transport::close));
+        if tokio::time::timeout(timeout, closing).await.is_err() {
+            tracing::warn!("some connections did not close in time; dropped them");
+        }
     }
 
     fn endpoint(&self, slot: &str) -> Option<&N::Endpoint> {

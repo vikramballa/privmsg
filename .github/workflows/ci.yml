@@ -8,6 +8,8 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to commit SHAs (tags can be moved to other code).
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -19,10 +21,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # rustup picks up rust-toolchain.toml (pinned compiler + clippy/rustfmt).
       - run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       # --locked: never let CI re-resolve the pinned Nym tree.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -32,9 +34,9 @@ jobs:
     # Keeps the fuzz targets compiling; fuzzing itself is run by hand.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install nightly --profile minimal
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked

@@ -1,0 +1,38 @@
+[package]
+name = "privmsg-mobile"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The privmsg messenger as a library for the phone apps (Swift bindings via UniFFI)."
+
+[lib]
+# `staticlib` is what the iPhone app links; `lib` for the tests and the
+# binding generator.
+crate-type = ["lib", "staticlib"]
+
+[[bin]]
+# Writes the Swift bindings: scripts/build-ios.sh runs it.
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+# Tor linked in as a library (the phone can't start a tor program). Off,
+# Tor runs as a program as on the desktop, which is enough to try the
+# library on a Mac.
+embedded-tor = ["privmsg-transport/embedded-tor"]
+# The binding generator (only the `uniffi-bindgen` tool needs it).
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+privmsg-node = { path = "../node" }
+privmsg-transport = { path = "../transport" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uniffi = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

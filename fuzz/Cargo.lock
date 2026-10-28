@@ -1130,6 +1130,7 @@ dependencies = [
  "openmls_traits",
  "serde",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]

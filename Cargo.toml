@@ -4,6 +4,7 @@ members = [
     "crates/crypto",
     "crates/transport",
     "crates/node",
+    "crates/mobile",
 ]
 
 # Shared dependency versions. Pin everything — reproducible builds are a
@@ -24,6 +25,9 @@ tempfile = "3"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 qrcode = { version = "0.14", default-features = false }
+
+# --- Swift bindings for the iPhone app (crates/mobile) ---
+uniffi = "0.32"
 
 # --- macOS keychain (already in the tree via Nym's TLS stack) ---
 security-framework = "2.11"
@@ -51,6 +55,9 @@ openmls = "0.6"
 openmls_rust_crypto = "0.3"
 openmls_basic_credential = "0.3"
 openmls_traits = "0.3"
+# Only to refuse low-order keys hpke-rs 0.2 doesn't check (RUSTSEC-2026-0072);
+# the version OpenMLS already uses.
+x25519-dalek = "2"
 
 # --- Transport layer (Nym) ---
 # Published on crates.io again; pinned exactly for reproducible builds.
@@ -74,6 +81,11 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["socks"] 
 # Nym's gateway client with one addition: connect through Tor's SOCKS port.
 # See vendor/README.md.
 nym-gateway-client = { path = "vendor/nym-gateway-client" }
+# Nym's SQLite helper reads its own open files through proc_pidinfo, which
+# doesn't build for iOS as published. See vendor/README.md.
+proc_pidinfo = { path = "vendor/proc_pidinfo" }
+# Leaves out sysinfo, which doesn't build for iOS, there. See vendor/README.md.
+nym-statistics-common = { path = "vendor/nym-statistics-common" }
 
 # OpenMLS 0.6 has `debug_assert!(false)` on AEAD failure, so in debug builds a
 # single corrupted or forged packet from the network would panic the node.

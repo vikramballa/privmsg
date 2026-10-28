@@ -191,6 +191,11 @@ impl Node {
         }
     }
 
+    /// Whether `passphrase` unlocks this profile (for a screen lock).
+    pub fn check_passphrase(&self, passphrase: &str) -> bool {
+        self.profile.check_passphrase(passphrase)
+    }
+
     pub fn profile_dir(&self) -> &Path {
         self.profile.dir()
     }
@@ -503,6 +508,17 @@ impl Node {
             self.release_slot(mux, &slot.id).await?;
         }
         self.save()
+    }
+
+    /// The conversation's safety number. Both sides see the same one unless
+    /// someone else sits in the middle (say, by intercepting the invite).
+    pub fn safety_number(&self, name: &str) -> Result<String> {
+        let group_id = &self.contact(name)?.group_id;
+        let session = self
+            .sessions
+            .get(group_id)
+            .ok_or_else(|| anyhow!("conversation state is missing"))?;
+        Ok(session.safety_number())
     }
 
     /// The contact has seen everything that arrived so far.
@@ -1012,6 +1028,35 @@ mod tests {
         bob.node.set_timer(&mut bob.mux, "alice", None).await?;
         alice.recv().await?;
         assert_eq!(alice.node.contact("bob")?.disappear_after, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_sides_see_the_same_safety_number() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (alice, bob) = connected(&net).await?;
+        let mut carol = Peer::new(&net)?;
+        let mut dave = Peer::new(&net)?;
+        connect(&mut carol, "dave", &mut dave, "carol").await?;
+        let number = alice.node.safety_number("bob")?;
+        assert_eq!(number, bob.node.safety_number("alice")?);
+        assert_ne!(number, carol.node.safety_number("dave")?);
+        assert_eq!(number, alice.reopen()?.node.safety_number("bob")?, "stable");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn contacts_cannot_link_us_by_mls_key() -> Result<()> {
+        // Bob invites Alice and Carol; they compare what they received.
+        let net = MemoryNetwork::default();
+        let mut bob = Peer::new(&net)?;
+        let first = bob.node.create_invite(&mut bob.mux, "alice").await?;
+        let second = bob.node.create_invite(&mut bob.mux, "carol").await?;
+        let key = |code: &str| -> Result<Vec<u8>> {
+            let kp = decode_key_package(&Invite::from_code(code)?.key_package)?;
+            Ok(kp.leaf_node().signature_key().as_slice().to_vec())
+        };
+        assert_ne!(key(&first)?, key(&second)?);
         Ok(())
     }
 

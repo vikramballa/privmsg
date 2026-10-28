@@ -34,6 +34,12 @@ pub fn set_socks5_proxy(proxy: Socks5Proxy) -> bool {
     SOCKS5_PROXY.set(proxy).is_ok()
 }
 
+/// privmsg patch: numbers each connection, so each gets its own SOCKS user
+/// name and with it (Tor's IsolateSOCKSAuth) its own circuit — even two of
+/// this process's clients on the same gateway never share an exit.
+#[cfg(not(target_arch = "wasm32"))]
+static SOCKS5_CONNECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// privmsg patch: connect through the SOCKS5 proxy. The gateway's host name
 /// goes to the proxy unresolved, so no DNS lookup leaves this machine.
 #[cfg(not(target_arch = "wasm32"))]
@@ -53,10 +59,12 @@ async fn connect_async_via_socks5(
         .ok_or(GatewayClientError::InvalidUrl(endpoint.to_owned()))?
         .trim_start_matches('[')
         .trim_end_matches(']');
+    let n = SOCKS5_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let username = format!("{}-{n}", proxy.username);
     let stream = tokio_socks::tcp::Socks5Stream::connect_with_password(
         proxy.address,
         (host, port),
-        &proxy.username,
+        &username,
         &proxy.password,
     )
     .await

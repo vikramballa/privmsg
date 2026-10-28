@@ -10,6 +10,7 @@ openmls = { workspace = true }
 openmls_rust_crypto = { workspace = true }
 openmls_basic_credential = { workspace = true }
 openmls_traits = { workspace = true }
+x25519-dalek = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

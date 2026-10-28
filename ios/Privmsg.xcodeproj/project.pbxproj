@@ -1,0 +1,501 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		08606548B6C3E6E364E1674C /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8FB42A400ACD102FEBDA6397 /* SystemConfiguration.framework */; };
+		3D75BE83941995C5A87FB04D /* ChatListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 737485FBBE875FECC6A82D12 /* ChatListView.swift */; };
+		3DFCF84FAF5D9077C28994AE /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EF42F240B34CF607C0015241 /* Security.framework */; };
+		3F76C93A19724D90D49074E4 /* LiveTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC8FEB287C46FAAD4AA233D9 /* LiveTests.swift */; };
+		401A18615C9BF411FEC902B2 /* privmsg_mobile.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0FF71A1CD43FF0FEFA3034E /* privmsg_mobile.swift */; };
+		4D86E358B1BC7609C9117DFE /* PrivmsgCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A454BCF2A4CF5463641B998B /* PrivmsgCore.xcframework */; };
+		539153D8F66809FAA1DA7DEF /* PrivmsgApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D617CFE9F2F9FB5729F1BCE /* PrivmsgApp.swift */; };
+		66B98C31D0269E59B90D7441 /* InviteViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB0AD09ABDC06AB380820255 /* InviteViews.swift */; };
+		7E7792DF9C0BB61261EB4564 /* libresolv.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 95C5197268B53466C16A20BF /* libresolv.tbd */; };
+		84963A7BC69D53EA0213EBCA /* UnlockViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E76538534014FC30228217 /* UnlockViews.swift */; };
+		8E3D7C99DB109C4E43447693 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = E77E101B440E0FA28B069900 /* AppModel.swift */; };
+		AA223E175B736D9952CB7C51 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 9BCDA9BFB625A6794531E20E /* libz.tbd */; };
+		CD9922C0930160BB54752875 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EF5328B71FA57F86E87AB98 /* ChatView.swift */; };
+		CE1D73E5F89DE5022EC6B993 /* Privacy.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBEB02A7B05AFB08FDA90A8A /* Privacy.swift */; };
+		CF38966A5883FC3A40DB84BF /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84018AD3A8A03F39C7C5A3B7 /* SettingsView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		D62F3FECB337E31B38346601 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = EF8A6F8D089136067E04BDC7 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0CC5E862019C087887DB908C;
+			remoteInfo = Privmsg;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		2D617CFE9F2F9FB5729F1BCE /* PrivmsgApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivmsgApp.swift; sourceTree = "<group>"; };
+		44E76538534014FC30228217 /* UnlockViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnlockViews.swift; sourceTree = "<group>"; };
+		4F669839D42FB78E3D4561DF /* PrivmsgUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = PrivmsgUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		5EF5328B71FA57F86E87AB98 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
+		5F0EE1417E7D8AFE4FB24CFE /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		737485FBBE875FECC6A82D12 /* ChatListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatListView.swift; sourceTree = "<group>"; };
+		84018AD3A8A03F39C7C5A3B7 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		8FB42A400ACD102FEBDA6397 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
+		95C5197268B53466C16A20BF /* libresolv.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libresolv.tbd; path = usr/lib/libresolv.tbd; sourceTree = SDKROOT; };
+		9BCDA9BFB625A6794531E20E /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libz.tbd; path = usr/lib/libz.tbd; sourceTree = SDKROOT; };
+		A0FF71A1CD43FF0FEFA3034E /* privmsg_mobile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = privmsg_mobile.swift; sourceTree = "<group>"; };
+		A454BCF2A4CF5463641B998B /* PrivmsgCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = PrivmsgCore.xcframework; path = build/PrivmsgCore.xcframework; sourceTree = "<group>"; };
+		AF30B601111C6BF55435E295 /* Privmsg.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Privmsg.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E77E101B440E0FA28B069900 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		EB0AD09ABDC06AB380820255 /* InviteViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InviteViews.swift; sourceTree = "<group>"; };
+		EBEB02A7B05AFB08FDA90A8A /* Privacy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Privacy.swift; sourceTree = "<group>"; };
+		EF42F240B34CF607C0015241 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		FC8FEB287C46FAAD4AA233D9 /* LiveTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTests.swift; sourceTree = "<group>"; };
+		"TEMP_7FD64B84-0DCF-4E41-880B-6A3E02F1AFA2" /* Privmsg.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Privmsg.xcconfig; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		0384C39817AEF5464811D8D0 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4D86E358B1BC7609C9117DFE /* PrivmsgCore.xcframework in Frameworks */,
+				AA223E175B736D9952CB7C51 /* libz.tbd in Frameworks */,
+				7E7792DF9C0BB61261EB4564 /* libresolv.tbd in Frameworks */,
+				3DFCF84FAF5D9077C28994AE /* Security.framework in Frameworks */,
+				08606548B6C3E6E364E1674C /* SystemConfiguration.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		3B98EE357844BA23352A49BB /* Generated */ = {
+			isa = PBXGroup;
+			children = (
+				A0FF71A1CD43FF0FEFA3034E /* privmsg_mobile.swift */,
+			);
+			path = Generated;
+			sourceTree = "<group>";
+		};
+		4F118F25E5963399F3AE0009 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AF30B601111C6BF55435E295 /* Privmsg.app */,
+				4F669839D42FB78E3D4561DF /* PrivmsgUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		56CB908E286E1EBF059F8177 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				95C5197268B53466C16A20BF /* libresolv.tbd */,
+				9BCDA9BFB625A6794531E20E /* libz.tbd */,
+				A454BCF2A4CF5463641B998B /* PrivmsgCore.xcframework */,
+				EF42F240B34CF607C0015241 /* Security.framework */,
+				8FB42A400ACD102FEBDA6397 /* SystemConfiguration.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		864348C21096CEF1898FCD99 = {
+			isa = PBXGroup;
+			children = (
+				A8375073EAD3F1D26E12D922 /* Privmsg */,
+				88663AA9AD893FE60392B4C4 /* PrivmsgUITests */,
+				56CB908E286E1EBF059F8177 /* Frameworks */,
+				4F118F25E5963399F3AE0009 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		88663AA9AD893FE60392B4C4 /* PrivmsgUITests */ = {
+			isa = PBXGroup;
+			children = (
+				FC8FEB287C46FAAD4AA233D9 /* LiveTests.swift */,
+			);
+			path = PrivmsgUITests;
+			sourceTree = "<group>";
+		};
+		A8375073EAD3F1D26E12D922 /* Privmsg */ = {
+			isa = PBXGroup;
+			children = (
+				E77E101B440E0FA28B069900 /* AppModel.swift */,
+				737485FBBE875FECC6A82D12 /* ChatListView.swift */,
+				5EF5328B71FA57F86E87AB98 /* ChatView.swift */,
+				5F0EE1417E7D8AFE4FB24CFE /* Info.plist */,
+				EB0AD09ABDC06AB380820255 /* InviteViews.swift */,
+				EBEB02A7B05AFB08FDA90A8A /* Privacy.swift */,
+				2D617CFE9F2F9FB5729F1BCE /* PrivmsgApp.swift */,
+				84018AD3A8A03F39C7C5A3B7 /* SettingsView.swift */,
+				44E76538534014FC30228217 /* UnlockViews.swift */,
+				3B98EE357844BA23352A49BB /* Generated */,
+			);
+			path = Privmsg;
+			sourceTree = "<group>";
+		};
+		"TEMP_8F6DAC66-2F96-4562-BA36-D10A067033FE" /* ios */ = {
+			isa = PBXGroup;
+			children = (
+				"TEMP_7FD64B84-0DCF-4E41-880B-6A3E02F1AFA2" /* Privmsg.xcconfig */,
+			);
+			path = ios;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		0CC5E862019C087887DB908C /* Privmsg */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FE0512482BBB076F8D695DDE /* Build configuration list for PBXNativeTarget "Privmsg" */;
+			buildPhases = (
+				08F58B3FDF2E49BF8351013B /* Sources */,
+				0384C39817AEF5464811D8D0 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Privmsg;
+			packageProductDependencies = (
+			);
+			productName = Privmsg;
+			productReference = AF30B601111C6BF55435E295 /* Privmsg.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A119D36FB70E5F38462ABAA1 /* PrivmsgUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8AFBB6D7454D0225FFE8FA88 /* Build configuration list for PBXNativeTarget "PrivmsgUITests" */;
+			buildPhases = (
+				305934C7EF0B90BDEC4644A3 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5B030AA55A06B4347BE94ACC /* PBXTargetDependency */,
+			);
+			name = PrivmsgUITests;
+			packageProductDependencies = (
+			);
+			productName = PrivmsgUITests;
+			productReference = 4F669839D42FB78E3D4561DF /* PrivmsgUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		EF8A6F8D089136067E04BDC7 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					0CC5E862019C087887DB908C = {
+						ProvisioningStyle = Automatic;
+					};
+					A119D36FB70E5F38462ABAA1 = {
+						TestTargetID = 0CC5E862019C087887DB908C;
+					};
+				};
+			};
+			buildConfigurationList = 5AB59C04472F6AD98BB4A180 /* Build configuration list for PBXProject "Privmsg" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 864348C21096CEF1898FCD99;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 4F118F25E5963399F3AE0009 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				0CC5E862019C087887DB908C /* Privmsg */,
+				A119D36FB70E5F38462ABAA1 /* PrivmsgUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		08F58B3FDF2E49BF8351013B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				8E3D7C99DB109C4E43447693 /* AppModel.swift in Sources */,
+				3D75BE83941995C5A87FB04D /* ChatListView.swift in Sources */,
+				CD9922C0930160BB54752875 /* ChatView.swift in Sources */,
+				66B98C31D0269E59B90D7441 /* InviteViews.swift in Sources */,
+				CE1D73E5F89DE5022EC6B993 /* Privacy.swift in Sources */,
+				539153D8F66809FAA1DA7DEF /* PrivmsgApp.swift in Sources */,
+				CF38966A5883FC3A40DB84BF /* SettingsView.swift in Sources */,
+				84963A7BC69D53EA0213EBCA /* UnlockViews.swift in Sources */,
+				401A18615C9BF411FEC902B2 /* privmsg_mobile.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		305934C7EF0B90BDEC4644A3 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				3F76C93A19724D90D49074E4 /* LiveTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		5B030AA55A06B4347BE94ACC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0CC5E862019C087887DB908C /* Privmsg */;
+			targetProxy = D62F3FECB337E31B38346601 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		02C9C14EA8F346DC1190CC5B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = "TEMP_7FD64B84-0DCF-4E41-880B-6A3E02F1AFA2" /* Privmsg.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		483183EA57347EA4BFFDCBF1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"build\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Privmsg/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		4E4D8C6A426094D368CF56D3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(inherited).uitests";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Privmsg;
+			};
+			name = Release;
+		};
+		4F4884994A53919379EFD57C /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = "TEMP_7FD64B84-0DCF-4E41-880B-6A3E02F1AFA2" /* Privmsg.xcconfig */;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		70F0F7402F5C33EFEA05AF5F /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"build\"",
+				);
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Privmsg/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		7D529C5318E172BE43E9A0C1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(inherited).uitests";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Privmsg;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		5AB59C04472F6AD98BB4A180 /* Build configuration list for PBXProject "Privmsg" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				02C9C14EA8F346DC1190CC5B /* Debug */,
+				4F4884994A53919379EFD57C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		8AFBB6D7454D0225FFE8FA88 /* Build configuration list for PBXNativeTarget "PrivmsgUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7D529C5318E172BE43E9A0C1 /* Debug */,
+				4E4D8C6A426094D368CF56D3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		FE0512482BBB076F8D695DDE /* Build configuration list for PBXNativeTarget "Privmsg" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				70F0F7402F5C33EFEA05AF5F /* Debug */,
+				483183EA57347EA4BFFDCBF1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = EF8A6F8D089136067E04BDC7 /* Project object */;
+}

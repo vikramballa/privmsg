@@ -5,10 +5,12 @@
 //! `state.enc`, sealed with a key derived from the user's passphrase:
 //!
 //! ```text
-//! "PRIVMSG4" | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
+//! "PRIVMSG5" | KDF cost (12) | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
 //! ```
 //!
-//! The key is Argon2id(passphrase, salt). The header is bound as AEAD
+//! The key is Argon2id(passphrase, salt) with the cost in the header
+//! (memory in KiB, passes, lanes; each a little-endian u32), so it can be
+//! raised later without a new format. The header is bound as AEAD
 //! associated data, so it can't be swapped without detection. Writes go to a
 //! temp file and are renamed into place, so a crash never leaves a torn file.
 //!
@@ -17,7 +19,9 @@
 //! [`LEGACY_SLOT`], and every contact is due for an address rotation.
 //! Version 2 profiles (`"PRIVMSG2"`) only lack the network settings and get
 //! the defaults. Version 3 profiles (`"PRIVMSG3"`) lack disappearing
-//! messages and auto-sleep, which start off.
+//! messages and auto-sleep, which start off. Versions 1–4 used the Argon2
+//! crate's default cost and no cost field; they are re-keyed at [`KDF`] when
+//! opened.
 //!
 //! Not covered: the Nym clients' own files under `slots/` (their keys and
 //! gateway registrations) are written by the Nym SDK and are not encrypted
@@ -36,19 +40,39 @@ use privmsg_transport::DataMode;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"PRIVMSG4";
+const MAGIC: &[u8; 8] = b"PRIVMSG5";
+const MAGIC_V4: &[u8; 8] = b"PRIVMSG4";
 const MAGIC_V3: &[u8; 8] = b"PRIVMSG3";
 const MAGIC_V2: &[u8; 8] = b"PRIVMSG2";
 const MAGIC_V1: &[u8; 8] = b"PRIVMSG1";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
-const HEADER_LEN: usize = MAGIC.len() + SALT_LEN;
+const KDF_LEN: usize = 12;
+const HEADER_LEN: usize = MAGIC.len() + KDF_LEN + SALT_LEN;
+/// Header length of versions 1–4, which had no cost field.
+const OLD_HEADER_LEN: usize = MAGIC.len() + SALT_LEN;
 const STATE_FILE: &str = "state.enc";
 const LOCK_FILE: &str = "lock";
 const SLOTS_DIR: &str = "slots";
 const TOR_DIR: &str = "tor";
 /// Where a version 1 profile kept its one Nym client.
 const NYM_DIR_V1: &str = "nym";
+
+/// Argon2id cost for new and re-keyed profiles: 64 MiB, 3 passes, 1 lane
+/// (RFC 9106's second recommended setting, about 0.2 s on a laptop). Tests
+/// use a cheap cost so the suite stays fast.
+#[cfg(not(any(test, fuzzing)))]
+const KDF: Kdf = Kdf {
+    memory_kib: 64 * 1024,
+    passes: 3,
+    lanes: 1,
+};
+#[cfg(any(test, fuzzing))]
+const KDF: Kdf = Kdf {
+    memory_kib: 64,
+    passes: 1,
+    lanes: 1,
+};
 
 /// Messages kept per contact; older ones are dropped.
 pub const HISTORY_LIMIT: usize = 500;
@@ -328,10 +352,15 @@ impl From<v1::State> for State {
     }
 }
 
+/// Shortest passphrase accepted for a new profile. Existing profiles keep
+/// whatever they were created with.
+pub const MIN_PASSPHRASE: usize = 12;
+
 /// An open, unlocked profile directory. Holds an exclusive lock for as long
 /// as it lives, so two privmsg processes can't overwrite each other.
 pub struct Profile {
     dir: PathBuf,
+    kdf: Kdf,
     salt: [u8; SALT_LEN],
     key: Zeroizing<[u8; 32]>,
     _lock: File,
@@ -354,9 +383,22 @@ impl Profile {
         OsRng.fill_bytes(&mut salt);
         Ok(Self {
             dir: dir.to_path_buf(),
-            key: derive_key(passphrase, &salt)?,
+            key: derive_key(KDF, passphrase, &salt)?,
+            kdf: KDF,
             salt,
             _lock: lock,
+        })
+    }
+
+    /// Whether `passphrase` is the one this profile is locked with. Takes
+    /// as long as unlocking does.
+    pub fn check_passphrase(&self, passphrase: &str) -> bool {
+        // Without early exit, though after Argon2 timing reveals nothing.
+        derive_key(self.kdf, passphrase, &self.salt).is_ok_and(|key| {
+            key.iter()
+                .zip(self.key.iter())
+                .fold(0, |acc, (a, b)| acc | (a ^ b))
+                == 0
         })
     }
 
@@ -368,35 +410,53 @@ impl Profile {
         }
         let lock = lock(dir)?;
         let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let current = data.starts_with(MAGIC);
         let version_1 = data.starts_with(MAGIC_V1);
         let version_2 = data.starts_with(MAGIC_V2);
         let version_3 = data.starts_with(MAGIC_V3);
-        if data.len() < HEADER_LEN + NONCE_LEN
-            || !(data.starts_with(MAGIC) || version_3 || version_2 || version_1)
+        let version_4 = data.starts_with(MAGIC_V4);
+        let header_len = if current { HEADER_LEN } else { OLD_HEADER_LEN };
+        if data.len() < header_len + NONCE_LEN
+            || !(current || version_4 || version_3 || version_2 || version_1)
         {
             bail!("{} is not a privmsg profile", path.display());
         }
-        let salt: [u8; SALT_LEN] = data[MAGIC.len()..HEADER_LEN].try_into()?;
-        let key = derive_key(passphrase, &salt)?;
+        let (kdf, salt): (Kdf, [u8; SALT_LEN]) = if current {
+            let kdf = Kdf::decode(&data[MAGIC.len()..MAGIC.len() + KDF_LEN])
+                .with_context(|| format!("{} has a damaged header", path.display()))?;
+            (kdf, data[MAGIC.len() + KDF_LEN..HEADER_LEN].try_into()?)
+        } else {
+            (Kdf::LEGACY, data[MAGIC.len()..OLD_HEADER_LEN].try_into()?)
+        };
+        let key = derive_key(kdf, passphrase, &salt)?;
 
-        let nonce = XNonce::from_slice(&data[HEADER_LEN..HEADER_LEN + NONCE_LEN]);
+        let nonce = XNonce::from_slice(&data[header_len..header_len + NONCE_LEN]);
         let plaintext = Zeroizing::new(
             XChaCha20Poly1305::new(key.as_ref().into())
                 .decrypt(
                     nonce,
                     Payload {
-                        msg: &data[HEADER_LEN + NONCE_LEN..],
-                        aad: &data[..HEADER_LEN],
+                        msg: &data[header_len + NONCE_LEN..],
+                        aad: &data[..header_len],
                     },
                 )
                 .map_err(|_| anyhow!("wrong passphrase, or the profile is corrupted"))?,
         );
-        let profile = Self {
+        let mut profile = Self {
             dir: dir.to_path_buf(),
+            kdf,
             salt,
             key,
             _lock: lock,
         };
+        let rekey = !current || kdf.weaker_than(KDF);
+        if rekey {
+            // Older format or an outdated cost: re-key with a fresh salt.
+            // Nothing is written until the save below.
+            OsRng.fill_bytes(&mut profile.salt);
+            profile.key = derive_key(KDF, passphrase, &profile.salt)?;
+            profile.kdf = KDF;
+        }
         if version_2 || version_3 {
             let state = if version_3 {
                 State::from(
@@ -410,11 +470,15 @@ impl Profile {
                 )
             };
             profile.save(&state)?;
-            tracing::info!("upgraded profile to version 4");
+            tracing::info!("upgraded profile to version 5");
             return Ok((profile, state));
         }
         if !version_1 {
             let state = bincode::deserialize(&plaintext).context("decode profile state")?;
+            if rekey {
+                profile.save(&state)?;
+                tracing::info!("re-keyed profile with the current passphrase cost");
+            }
             return Ok((profile, state));
         }
 
@@ -429,7 +493,7 @@ impl Profile {
         }
         let state = State::from(old);
         profile.save(&state)?;
-        tracing::info!("upgraded profile to version 4");
+        tracing::info!("upgraded profile to version 5");
         Ok((profile, state))
     }
 
@@ -438,6 +502,7 @@ impl Profile {
         let plaintext = Zeroizing::new(bincode::serialize(state).context("encode state")?);
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(MAGIC);
+        header.extend_from_slice(&self.kdf.encode());
         header.extend_from_slice(&self.salt);
 
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -514,9 +579,57 @@ fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::rename(from, to)
 }
 
-fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+/// Argon2id cost, as stored in the profile header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Kdf {
+    memory_kib: u32,
+    passes: u32,
+    lanes: u32,
+}
+
+impl Kdf {
+    /// What versions 1–4 used: the argon2 crate's defaults.
+    const LEGACY: Kdf = Kdf {
+        memory_kib: argon2::Params::DEFAULT_M_COST,
+        passes: argon2::Params::DEFAULT_T_COST,
+        lanes: argon2::Params::DEFAULT_P_COST,
+    };
+
+    /// Whether this cost is below `other` in memory or passes. A profile
+    /// saved by a newer build with a higher cost keeps it.
+    fn weaker_than(self, other: Kdf) -> bool {
+        self.memory_kib < other.memory_kib || self.passes < other.passes
+    }
+
+    fn encode(self) -> [u8; KDF_LEN] {
+        let mut out = [0u8; KDF_LEN];
+        out[..4].copy_from_slice(&self.memory_kib.to_le_bytes());
+        out[4..8].copy_from_slice(&self.passes.to_le_bytes());
+        out[8..].copy_from_slice(&self.lanes.to_le_bytes());
+        out
+    }
+
+    /// Read a cost from a header, refusing ones so large that a tampered
+    /// file could make unlocking hang or run out of memory.
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+        let kdf = Kdf {
+            memory_kib: word(0),
+            passes: word(4),
+            lanes: word(8),
+        };
+        if kdf.memory_kib > 1024 * 1024 || kdf.passes > 64 || kdf.lanes > 16 {
+            bail!("passphrase cost out of range: {kdf:?}");
+        }
+        Ok(kdf)
+    }
+}
+
+fn derive_key(kdf: Kdf, passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    let params = argon2::Params::new(kdf.memory_kib, kdf.passes, kdf.lanes, Some(32))
+        .map_err(|e| anyhow!("passphrase cost: {e}"))?;
     let mut key = Zeroizing::new([0u8; 32]);
-    Argon2::default()
+    Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
         .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
         .map_err(|e| anyhow!("derive key: {e}"))?;
     Ok(key)
@@ -606,7 +719,7 @@ mod tests {
     /// Write `state` under an older format's `magic`.
     fn write_old(magic: &[u8; 8], dir: &Path, passphrase: &str, state: &[u8]) -> Result<()> {
         let salt = [3u8; SALT_LEN];
-        let key = derive_key(passphrase, &salt)?;
+        let key = derive_key(Kdf::LEGACY, passphrase, &salt)?;
         let mut header = magic.to_vec();
         header.extend_from_slice(&salt);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
@@ -756,6 +869,50 @@ mod tests {
     }
 
     #[test]
+    fn version_4_profile_is_rekeyed_at_the_current_cost() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write_old(
+            MAGIC_V4,
+            dir.path(),
+            "pw",
+            &bincode::serialize(&sample_state())?,
+        )?;
+        let (_, state) = Profile::open(dir.path(), "pw")?;
+        assert_eq!(state.contacts[0].history[0].text, "hi");
+
+        let raw = fs::read(dir.path().join(STATE_FILE))?;
+        assert!(raw.starts_with(MAGIC), "rewritten as the current version");
+        assert_eq!(Kdf::decode(&raw[MAGIC.len()..][..KDF_LEN])?, KDF);
+        assert_ne!(&raw[MAGIC.len() + KDF_LEN..HEADER_LEN], &[3u8; SALT_LEN]);
+        let (_, again) = Profile::open(dir.path(), "pw")?;
+        assert_eq!(again.contacts[0].history[0].text, "hi");
+        Ok(())
+    }
+
+    #[test]
+    fn passphrase_cost_is_bound_and_bounded() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        Profile::create(dir.path(), "pw")?.save(&sample_state())?;
+        let path = dir.path().join(STATE_FILE);
+        let good = fs::read(&path)?;
+
+        // A lowered cost changes the key and fails authentication.
+        let mut lowered = good.clone();
+        let half = KDF.memory_kib / 2;
+        lowered[MAGIC.len()..][..4].copy_from_slice(&half.to_le_bytes());
+        fs::write(&path, &lowered)?;
+        assert!(Profile::open(dir.path(), "pw").is_err());
+
+        // An absurd cost is refused before any work is done.
+        let mut huge = good;
+        huge[MAGIC.len()..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, &huge)?;
+        let err = Profile::open(dir.path(), "pw").err().unwrap();
+        assert!(format!("{err:#}").contains("out of range"));
+        Ok(())
+    }
+
+    #[test]
     fn save_and_reopen() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let profile = Profile::create(dir.path(), "correct horse")?;
@@ -783,6 +940,15 @@ mod tests {
         Profile::create(dir.path(), "right")?.save(&sample_state())?;
         let err = Profile::open(dir.path(), "wrong").err().unwrap();
         assert!(err.to_string().contains("wrong passphrase"));
+        Ok(())
+    }
+
+    #[test]
+    fn passphrase_check_matches_only_the_right_one() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = Profile::create(dir.path(), "right")?;
+        assert!(profile.check_passphrase("right"));
+        assert!(!profile.check_passphrase("wrong"));
         Ok(())
     }
 

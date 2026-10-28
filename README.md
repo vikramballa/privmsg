@@ -21,6 +21,8 @@ both:
 - 💨 **Disappearing messages** that are deleted on both sides.
 - 📶 **Light on data:** about 9 MB an hour in the default mode, and nothing
   at all while it's closed.
+- 📱 **iPhone app (test version)** that talks to the desktop app, with Tor
+  built in. See [iPhone](#iphone-test-version).
 
 > ⚠️ **Status: prototype.** It works end to end on the live Nym network,
 > but it has **not been independently security-audited**. Please don't
@@ -108,7 +110,8 @@ and the encryption layer never sees an IP address.
 ## Install
 
 Works on **Mac**, **Linux** (including Parrot, Kali, Ubuntu, Debian) and
-**Windows 10/11**.
+**Windows 10/11**, and as a test version on **iPhone**
+([below](#iphone-test-version)).
 
 ### Easiest: the ready-made download (about 20 MB)
 
@@ -195,6 +198,22 @@ there, press **Ctrl-O** in privmsg and then **Ctrl-V** (or right-click).
 Both install scripts also download Tor (checked against a pinned SHA-256)
 and put it next to privmsg.
 
+### iPhone (test version)
+
+The same messenger as an iPhone app: it talks to the desktop version, and
+Tor and the Nym mixnet run inside the app (no server). It isn't in the App
+Store; you build it on a Mac with Xcode and install it on your own iPhone
+with your Apple ID (free accounts re-install every 7 days):
+
+```bash
+scripts/build-ios.sh                     # first time: 10–20 minutes
+open -a Xcode ios/Privmsg.xcodeproj      # pick your iPhone, press Run
+```
+
+Step-by-step instructions, what's different on a phone (no notifications;
+connected only while the app is open) and its privacy settings are in
+[ios/README.md](ios/README.md).
+
 ---
 
 ## Quick start
@@ -205,7 +224,8 @@ and put it next to privmsg.
 privmsg
 ```
 
-The first time, it asks you to choose a password (at least 8 characters).
+The first time, it asks you to choose a password (at least 12 characters;
+four random words work well).
 It locks your messages on this computer, and it can't be recovered. On a
 Mac it offers to remember the password in your Keychain so you don't have
 to type it again.
@@ -213,8 +233,10 @@ to type it again.
 **2. Invite a friend:** press **Ctrl-N**, type a name for them (only you
 see it), and press **Enter**. Your invite code is shown and **copied to
 your clipboard**. Paste it to your friend any way you like (WhatsApp,
-Signal, email, a text). Each code works **once**. On Windows the code
-is kept out of Clipboard History and cloud clipboard sync.
+Signal, email, a text). Each code works **once**. The code leaves your
+clipboard after 3 minutes, or as soon as your friend joins (anything you
+copied since is left alone). On a Mac it isn't sent to your other Apple
+devices; on Windows it's kept out of Clipboard History and cloud sync.
 
 **3. Your friend enters it:** in their privmsg they press **Ctrl-O**, paste
 the code, press **Enter**, then type a name for you and press **Enter**.
@@ -240,7 +262,9 @@ seconds to arrive. That delay is part of what makes the traffic hard to
 analyse.
 
 💡 Whoever uses an invite first becomes that contact, so send codes in a
-chat you trust. Once connected, check it's really your friend.
+chat you trust. Once connected, type `/verify` and compare the safety
+number with your friend in person or on a call: if it matches, nobody
+intercepted the invite.
 
 **Just want to see it work?** `./scripts/try-it.sh` creates two test
 users on your computer, connects them, and opens a chat window for each.
@@ -262,6 +286,7 @@ users on your computer, connects them, and opens a chat window for each.
 | `privmsg contacts` | List contacts, unread counts and unused invites |
 | `privmsg history <name>` | Show saved messages with a contact |
 | `privmsg disappear <name> [off\|5m\|1h\|1d\|1w]` | Show or set disappearing messages with a contact (applies on both sides) |
+| `privmsg verify <name>` | Show the safety number to compare with a contact |
 | `privmsg rotate <name>` | Move a conversation to a new address now (it also happens weekly by itself) |
 | `privmsg remove <name>` | Forget a contact or unused invite, with its addresses and keys |
 | `privmsg address` | Show your mix address for each contact |
@@ -293,7 +318,7 @@ other PCs and OneDrive doesn't back up):
 
 | File | Contents | Protected? |
 |---|---|---|
-| `state.enc` | Your keys, contacts, conversations, message history | ✅ Encrypted with your passphrase (Argon2id + XChaCha20-Poly1305) |
+| `state.enc` | Your keys, contacts, conversations, message history | ✅ Encrypted with your passphrase (Argon2id, 64 MiB × 3 passes, + XChaCha20-Poly1305) |
 | `slots/` | One folder of Nym network keys per address (one per contact and per open invite, plus `sender`, which sends everything) | ⚠️ Not encrypted by privmsg, only by folder permissions: only your user account can open the profile folder (mode 0700 on Mac and Linux; on Windows an access list with your account as the only entry) |
 | `tor/` | Tor's directory cache and entry guards, so later starts are quick | Folder permissions, like `slots/` |
 | `lock` | Stops two copies of privmsg using the same profile | — |
@@ -315,8 +340,11 @@ the other way round.
 
 Every invite you create, and every invite you
 accept, gets its own Nym address (its own keys and a randomly chosen
-gateway). Two people you talk to can't compare notes and find out they're
-talking to the same person.
+gateway) and its own encryption identity, with its own key and a random
+name tag. Two people you talk to can't compare notes and find out they're
+talking to the same person. (Conversations started with v0.2.0 or earlier
+keep the shared encryption identity they began with; remove and re-add a
+contact to give it its own.)
 
 ### Weekly rotation
 
@@ -414,8 +442,9 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 ## What it protects (and what it doesn't)
 
 **Protected ✅**
-- **Message content:** end-to-end encrypted, with forward secrecy (old
-  messages stay safe if keys leak later) and post-compromise security.
+- **Message content:** end-to-end encrypted, with forward secrecy (each
+  message key is deleted once used, so a later leak doesn't expose
+  earlier messages).
 - **Tampering:** forged, modified or replayed messages are rejected.
 - **Who talks to whom:** hidden by the mixnet.
 - **Your IP address:** the mixnet hides it from your contacts, and Tor hides
@@ -424,8 +453,10 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 - **Identity:** no accounts or phone numbers. Contact nicknames never leave
   your device, and invite codes work only once.
 - **Data on disk:** encrypted with your passphrase.
-- **Linking your conversations:** each contact gets its own address, and
-  addresses rotate weekly.
+- **Linking your conversations:** each contact gets its own address and
+  its own encryption keys, and addresses rotate weekly.
+- **Someone intercepting an invite:** compare the safety number
+  (`privmsg verify <name>`, or `/verify` in the app) with your contact.
 - **When you write:** the sender's constant fake-packet stream hides it
   (unless you turn on auto-sleep); with decoys on, real messages are also
   hidden among decoys at your contact's end.
@@ -442,6 +473,11 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
   and decoys help a lot, but there's no formal guarantee. Being online at
   all is still visible.
 - **The `slots/` folder** isn't encrypted by privmsg.
+- **Recovery after a key leak:** conversation keys are never refreshed
+  after a conversation starts, so if someone copies your keys they can
+  read new messages too until you remove the contact and connect again.
+  (MLS can heal from this with regular key updates; privmsg doesn't do
+  them yet.)
 - **A hacked device:** if someone controls your computer, no messenger can
   protect you.
 - **Small user base:** a mixnet hides you in a crowd, so the more people use
@@ -504,6 +540,10 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
   - [x] One packet per message (faster delivery, less data)
   - [x] Disappearing messages (both sides), optional auto-sleep
   - [ ] "Lite" mode over Tor onion services only
+- [ ] **Phones**
+  - [x] iPhone app, test version (SwiftUI over the same Rust core, Tor built in)
+  - [ ] Tried on more real iPhones
+  - [ ] Android
 
 Ideas and bug reports are welcome. Please open an issue.
 
@@ -517,11 +557,16 @@ Ideas and bug reports are welcome. Please open an issue.
 crates/
   crypto/      Layer 1: MLS via OpenMLS (identities, groups, persistence)
   transport/   Layer 2: Nym clients (one sender + one mailbox per slot),
-               multiplexer, padding, Tor child process, test network
+               multiplexer, padding, Tor (child process, or linked in on
+               iPhone: feature `embedded-tor`), test network
   node/        The privmsg app: profile, wire format, invites, rotation,
                decoys (library), plus the CLI and terminal UI (binary)
-vendor/        nym-gateway-client with one patch: connect through Tor
-scripts/       install scripts; fetch-tor.sh (pinned, checksummed Tor)
+  mobile/      The layer the phone app talks to: one `Messenger` object
+               with Swift bindings (UniFFI), running node on its own thread
+ios/           The iPhone app (SwiftUI; Xcode project from project.yml)
+vendor/        Patched Nym crates: connect through Tor, and build for iOS
+scripts/       install scripts; fetch-tor.sh (pinned, checksummed Tor);
+               build-ios.sh and fetch-tor-ios.sh for the iPhone app
 fuzz/          cargo-fuzz targets for everything read from the network
 .github/workflows/  CI (fmt, clippy, tests) and release builds
 ```
@@ -529,7 +574,7 @@ fuzz/          cargo-fuzz targets for everything read from the network
 **Build and test**
 
 ```bash
-cargo test --workspace          # 70 tests, no network needed
+cargo test --workspace          # 84 tests, no network needed
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```

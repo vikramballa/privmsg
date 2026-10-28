@@ -19,6 +19,9 @@ use tokio::time::{sleep, Instant};
 
 use crate::{pad, unpad, DataMode, IncomingMessage, MixAddress, Network, Tor, Transport};
 
+/// Gateways a new address tries before giving up.
+const NEW_ADDRESS_TRIES: u32 = 3;
+
 /// Directory of the sender's keys. Slot names are random hex, so they
 /// can't collide with it.
 const SENDER_DIR: &str = "sender";
@@ -94,7 +97,35 @@ impl NymNetwork {
     ///
     /// Over Tor, a new address only picks gateways that speak TLS, so the
     /// Tor exit sees an encrypted stream rather than Nym's websocket.
+    ///
+    /// A new address registers with a gateway picked at random, and some
+    /// picks turn out unusable (down, or no TLS listener despite what the
+    /// directory says). Then it starts over with fresh keys and another
+    /// pick. An existing address keeps its gateway, since contacts write to
+    /// it, and tries once more after a pause (the Nym API it asks first
+    /// sometimes answers 502 through a Tor exit).
     async fn connect(&self, storage_dir: &Path, role: Role) -> Result<NymTransport> {
+        let fresh = !storage_dir.exists();
+        let tries = if fresh { NEW_ADDRESS_TRIES } else { 2 };
+        let mut attempt = 1;
+        loop {
+            match self.connect_once(storage_dir, role).await {
+                Err(e) if attempt < tries => {
+                    if fresh {
+                        tracing::warn!("new address failed ({e:#}); trying another gateway");
+                        std::fs::remove_dir_all(storage_dir).ok();
+                    } else {
+                        tracing::warn!("connecting failed ({e:#}); trying again");
+                        sleep(Duration::from_secs(3)).await;
+                    }
+                    attempt += 1;
+                }
+                done => return done,
+            }
+        }
+    }
+
+    async fn connect_once(&self, storage_dir: &Path, role: Role) -> Result<NymTransport> {
         crate::create_private_dir(storage_dir)
             .with_context(|| format!("create {}", storage_dir.display()))?;
         let paths = StoragePaths::new_from_dir(storage_dir)?;

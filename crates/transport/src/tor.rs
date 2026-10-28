@@ -18,6 +18,10 @@
 //!
 //! Host names go to Tor unresolved (`socks5h`), so DNS doesn't leak either.
 //! If Tor can't start, we stop rather than connect without it.
+//!
+//! Phones can't start other programs, so the iPhone app links the same C
+//! tor in as a library instead and runs it on a thread of its own
+//! ([`Tor::start_embedded`], behind the `embedded-tor` feature).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -56,8 +60,16 @@ nym_http_api_client::inventory::submit! {
 
 /// A running Tor. Dropping it stops Tor.
 pub struct Tor {
-    socks: SocketAddr,
-    _child: Child,
+    pub(crate) socks: SocketAddr,
+    pub(crate) _keep: Keep,
+}
+
+/// What keeps Tor running: the child process, or (embedded) the control
+/// connection that owns it.
+pub(crate) enum Keep {
+    Child(#[allow(dead_code)] Child),
+    #[cfg(feature = "embedded-tor")]
+    Control(#[allow(dead_code)] tokio::net::UnixStream),
 }
 
 impl Tor {
@@ -76,22 +88,8 @@ impl Tor {
             .with_context(|| format!("create {}", data_dir.display()))?;
 
         let mut command = Command::new(&binary);
-        // Our settings only: ignore any system-wide torrc.
-        let none = data_dir.join("no-torrc");
         command
-            .arg("-f")
-            .arg(&none)
-            .arg("--defaults-torrc")
-            .arg(&none)
-            .arg("--ignore-missing-torrc")
-            .arg("DataDirectory")
-            .arg(data_dir)
-            // Each gateway (and the API) gets its own circuit.
-            .args([
-                "SocksPort",
-                "127.0.0.1:auto IsolateDestAddr IsolateSOCKSAuth",
-            ])
-            .args(["ClientOnly", "1", "AvoidDiskWrites", "1"])
+            .args(arguments(data_dir))
             .args(["Log", "notice stdout"])
             // Tor exits by itself if privmsg dies without stopping it.
             .args(["__OwningControllerProcess", &std::process::id().to_string()])
@@ -141,7 +139,7 @@ impl Tor {
         });
         Ok(Self {
             socks,
-            _child: child,
+            _keep: Keep::Child(child),
         })
     }
 
@@ -169,6 +167,34 @@ impl Tor {
             .set(url)
             .map_err(|_| anyhow!("Nym is already routed through a Tor"))
     }
+}
+
+/// The settings privmsg runs Tor with, as command-line arguments.
+pub(crate) fn arguments(data_dir: &Path) -> Vec<std::ffi::OsString> {
+    // Our settings only: ignore any system-wide torrc.
+    let none = data_dir.join("no-torrc");
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-f".into(),
+        none.clone().into(),
+        "--defaults-torrc".into(),
+        none.into(),
+        "--ignore-missing-torrc".into(),
+        "DataDirectory".into(),
+        data_dir.into(),
+    ];
+    // Each gateway connection (numbered SOCKS user, see the vendored
+    // gateway client) and the API get their own circuits.
+    for arg in [
+        "SocksPort",
+        "127.0.0.1:auto IsolateDestAddr IsolateSOCKSAuth",
+        "ClientOnly",
+        "1",
+        "AvoidDiskWrites",
+        "1",
+    ] {
+        args.push(arg.into());
+    }
+    args
 }
 
 /// Read Tor's log until it is fully bootstrapped; the SOCKS port it chose.

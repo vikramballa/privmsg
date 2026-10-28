@@ -58,7 +58,12 @@ struct App {
     /// Shown in place of the conversation until a key is pressed (an
     /// invite code to copy).
     notice: Option<String>,
+    /// An invite code we put on the clipboard, and when to take it off.
+    copied: Option<(String, Instant)>,
 }
+
+/// How long an invite code stays on the clipboard if it isn't used.
+const CLIPBOARD_FOR: Duration = Duration::from_secs(180);
 
 /// What a key press asks for, decided without touching the network so it
 /// can be tested on its own.
@@ -163,9 +168,14 @@ pub async fn run(mut node: Node) -> Result<()> {
     terminal.clear()?;
     // So a pasted invite code arrives as one piece, not as keystrokes.
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste).ok();
-    let result = event_loop(&mut terminal, &mut node, &mut mux, &mut scheduler).await;
+    let mut app = App {
+        status: HELP.into(),
+        ..App::default()
+    };
+    let result = event_loop(&mut terminal, &mut node, &mut mux, &mut scheduler, &mut app).await;
     crossterm::execute!(std::io::stdout(), DisableBracketedPaste).ok();
     ratatui::restore();
+    uncopy(&mut app);
 
     if let Some(s) = scheduler.as_mut() {
         flush_queued(&mut node, &mut mux, s).await;
@@ -179,20 +189,17 @@ async fn event_loop(
     node: &mut Node,
     mux: &mut Network,
     scheduler: &mut Option<Scheduler>,
+    app: &mut App,
 ) -> Result<()> {
-    let mut app = App {
-        status: HELP.into(),
-        ..App::default()
-    };
     let mut keys = EventStream::new();
     let mut maintenance =
         tokio::time::interval_at(Instant::now() + MAINTENANCE_EVERY, MAINTENANCE_EVERY);
     let mut last_typed = Instant::now();
     loop {
-        if let Some(name) = selected_name(node, &app) {
+        if let Some(name) = selected_name(node, app) {
             node.mark_read(&name)?;
         }
-        terminal.draw(|f| draw(f, node, &app, scheduler.as_ref(), mux.is_awake()))?;
+        terminal.draw(|f| draw(f, node, app, scheduler.as_ref(), mux.is_awake()))?;
 
         let next_tick = scheduler.as_ref().and_then(Scheduler::next_due);
         let tick_at = next_tick.as_ref().map_or_else(far_future, |(_, at)| *at);
@@ -203,6 +210,7 @@ async fn event_loop(
             .filter(|_| scheduler.is_none())
             .map(|mins| Duration::from_secs(u64::from(mins) * 60));
         let sleep_at = idle_limit.map_or_else(far_future, |limit| last_typed + limit);
+        let uncopy_at = app.copied.as_ref().map_or_else(far_future, |(_, at)| *at);
         tokio::select! {
             msg = mux.recv() => {
                 let (slot, msg) = msg?;
@@ -211,11 +219,13 @@ async fn event_loop(
                         for event in events {
                             match event {
                                 Event::Joined { contact } => {
+                                    // The code has been used; don't leave it lying around.
+                                    uncopy(app);
                                     app.status = format!("✓ {} joined. Say hi!", clean(&contact));
                                     if app.mode == Mode::Chat {
                                         // The invite on screen has done its job.
                                         app.notice = None;
-                                        select(node, &mut app, &contact);
+                                        select(node, app, &contact);
                                     }
                                     if let Some(s) = scheduler.as_mut() {
                                         s.add(contact);
@@ -242,15 +252,15 @@ async fn event_loop(
                     if action != Action::Quit && !mux.is_awake() && idle_limit.is_some()
                         && !node.contacts().is_empty()
                     {
-                        wake(terminal, node, mux, &mut app, scheduler.as_ref()).await?;
+                        wake(terminal, node, mux, app, scheduler.as_ref()).await?;
                     }
                     match action {
                         Action::None => {}
                         Action::Quit => return Ok(()),
-                        Action::Move(step) => move_selection(node, &mut app, step),
-                        Action::Timer => step_timer(node, mux, &mut app).await,
+                        Action::Move(step) => move_selection(node, app, step),
+                        Action::Timer => step_timer(node, mux, app).await,
                         Action::Submit(mode, line) => {
-                            submit(node, mux, scheduler, &mut app, mode, &line).await
+                            submit(node, mux, scheduler, app, mode, &line).await
                         }
                     }
                 }
@@ -272,6 +282,7 @@ async fn event_loop(
                     app.status = format!("address maintenance failed: {e:#}");
                 }
             }
+            _ = tokio::time::sleep_until(uncopy_at), if app.copied.is_some() => uncopy(app),
             _ = tokio::time::sleep_until(sleep_at), if idle_limit.is_some() && mux.is_awake() => {
                 mux.sleep().await;
                 app.status =
@@ -351,6 +362,22 @@ async fn submit(
         (_, ["/add", name, code @ ..]) if !code.is_empty() => {
             add(node, mux, scheduler, app, &code.concat(), name).await
         }
+        (_, ["/verify"]) => match selected_name(node, app) {
+            Some(name) => match node.safety_number(&name) {
+                Ok(number) => {
+                    app.notice = Some(format!(
+                        "Safety number with {name}\n\n    {number}\n\n\
+                         Compare it with {name} in person or on a call (not in a chat\n\
+                         app). If it matches, nobody intercepted your invite. If it\n\
+                         doesn't, remove the contact and connect again with a new invite.\n\n\
+                         (press any key to go back)",
+                        name = clean(&name)
+                    ))
+                }
+                Err(e) => app.status = format!("{e:#}"),
+            },
+            None => app.status = "Pick a conversation first.".into(),
+        },
         (_, ["/disappear", word]) => match (parse_timer(word), selected_name(node, app)) {
             (Ok(after), Some(name)) => set_timer(node, mux, app, &name, after).await,
             (Err(e), _) => app.status = format!("{e:#}"),
@@ -387,9 +414,13 @@ async fn invite(node: &mut Node, mux: &mut Network, app: &mut App, name: &str) {
     app.status = format!("making an invite for {}…", clean(name));
     match node.create_invite(mux, name).await {
         Ok(code) => {
+            uncopy(app);
             let copied = copy_to_clipboard(&code);
+            if copied {
+                app.copied = Some((code.clone(), Instant::now() + CLIPBOARD_FOR));
+            }
             let how = if copied {
-                "✓ Copied to your clipboard. Paste it to"
+                "✓ Copied to your clipboard for 3 minutes. Paste it to"
             } else {
                 "Select and copy the code below, then send it to"
             };
@@ -431,35 +462,147 @@ async fn add(
     }
 }
 
-/// Put `text` on the system clipboard, if there is a clipboard tool.
+/// Take our invite code off the clipboard, unless something else has been
+/// copied since (that's the user's, and stays).
+fn uncopy(app: &mut App) {
+    if let Some((code, _)) = app.copied.take() {
+        if clipboard_text().is_some_and(|text| text.trim() == code) {
+            clear_clipboard();
+        }
+    }
+}
+
+/// On a Mac: copy for this Mac only (no Universal Clipboard to your other
+/// Apple devices) and marked concealed, so clipboard managers that follow
+/// the nspasteboard.org convention don't save it. Reads `text` from stdin.
+#[cfg(target_os = "macos")]
+const MAC_LOCAL_COPY: &str = "ObjC.import('AppKit');
+var data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+var text = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+var pb = $.NSPasteboard.generalPasteboard;
+pb.prepareForNewContentsWithOptions($.NSPasteboardContentsCurrentHostOnly);
+(pb.setStringForType(text, $.NSPasteboardTypeString)
+  && pb.setStringForType($(''), 'org.nspasteboard.ConcealedType')) ? 'ok' : 'failed';";
+
+/// Run `tool` with `input` on stdin; its stdout if it succeeded.
 #[cfg(not(windows))]
-fn copy_to_clipboard(text: &str) -> bool {
+fn run_tool(tool: &[&str], input: &str) -> Option<String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    let mut child = Command::new(tool[0])
+        .args(&tool[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(input.as_bytes())
+        .ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Put `text` on the system clipboard, if there is a clipboard tool.
+#[cfg(not(windows))]
+fn copy_to_clipboard(text: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    if run_tool(
+        &["osascript", "-l", "JavaScript", "-e", MAC_LOCAL_COPY],
+        text,
+    )
+    .is_some_and(|out| out.trim() == "ok")
+    {
+        return true;
+    }
     let tools: &[&[&str]] = &[
         &["pbcopy"],
         &["wl-copy"],
         &["xclip", "-selection", "clipboard"],
         &["xsel", "--clipboard", "--input"],
     ];
-    tools.iter().any(|tool| {
-        Command::new(tool[0])
-            .args(&tool[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .and_then(|mut child| {
-                child
-                    .stdin
-                    .take()
-                    .expect("piped")
-                    .write_all(text.as_bytes())?;
-                child.wait()
-            })
-            .is_ok_and(|status| status.success())
+    tools.iter().any(|tool| run_tool(tool, text).is_some())
+}
+
+/// What's on the clipboard now, if it can be read.
+#[cfg(not(windows))]
+fn clipboard_text() -> Option<String> {
+    let tools: &[&[&str]] = &[
+        &["pbpaste"],
+        &["wl-paste", "--no-newline"],
+        &["xclip", "-selection", "clipboard", "-o"],
+        &["xsel", "--clipboard", "--output"],
+    ];
+    tools.iter().find_map(|tool| run_tool(tool, ""))
+}
+
+#[cfg(not(windows))]
+fn clear_clipboard() {
+    copy_to_clipboard("");
+}
+
+/// Run `f` with the Windows clipboard open; `None` if it stayed busy.
+#[cfg(windows)]
+fn with_clipboard<T>(f: impl FnOnce() -> T) -> Option<T> {
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+
+    // SAFETY: opened once, always closed again.
+    unsafe {
+        // Another program may be holding the clipboard for a moment.
+        let mut tries = 0;
+        while OpenClipboard(std::ptr::null_mut()) == 0 {
+            tries += 1;
+            if tries == 10 {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = f();
+        CloseClipboard();
+        Some(out)
+    }
+}
+
+/// What's on the clipboard now, if it is text.
+#[cfg(windows)]
+fn clipboard_text() -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::GetClipboardData;
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+
+    with_clipboard(|| {
+        // SAFETY: the clipboard is open; the handle is locked while read
+        // and the read stays within its size.
+        unsafe {
+            let mem = GetClipboardData(CF_UNICODETEXT as u32);
+            if mem.is_null() {
+                return None;
+            }
+            let src = GlobalLock(mem).cast::<u16>();
+            if src.is_null() {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(src, GlobalSize(mem) / 2);
+            let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            let text = String::from_utf16_lossy(&units[..end]);
+            GlobalUnlock(mem);
+            Some(text)
+        }
     })
+    .flatten()
+}
+
+#[cfg(windows)]
+fn clear_clipboard() {
+    use windows_sys::Win32::System::DataExchange::EmptyClipboard;
+    // SAFETY: the clipboard is open.
+    with_clipboard(|| unsafe { EmptyClipboard() });
 }
 
 /// Put `text` on the Windows clipboard, kept out of Clipboard History and
@@ -703,6 +846,30 @@ fn last_that_fit(lines: &[String], area: Rect) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Uses the real clipboard, so it's opt-in: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn invite_code_leaves_the_clipboard_but_other_text_stays() {
+        let mut app = App::default();
+        let code = "privmsg1:clipboard-test".to_string();
+
+        assert!(copy_to_clipboard(&code));
+        assert_eq!(clipboard_text().unwrap().trim(), code);
+        app.copied = Some((code.clone(), Instant::now()));
+        uncopy(&mut app);
+        assert_eq!(clipboard_text().unwrap_or_default().trim(), "");
+
+        assert!(copy_to_clipboard(&code));
+        app.copied = Some((code, Instant::now()));
+        assert!(copy_to_clipboard("something the user copied"));
+        uncopy(&mut app);
+        assert_eq!(
+            clipboard_text().unwrap().trim(),
+            "something the user copied"
+        );
+        assert!(app.copied.is_none());
+    }
 
     fn press(app: &mut App, keys: &str) {
         for c in keys.chars() {

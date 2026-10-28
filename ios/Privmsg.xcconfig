@@ -1,0 +1,6 @@
+// Settings shared by every copy of the app. Each copy's own bundle
+// identifier and signing team are in Local.xcconfig, which
+// scripts/build-ios.sh makes once (and git ignores).
+APP_DISPLAY_NAME = privmsg
+PRODUCT_BUNDLE_IDENTIFIER = app.privmsg.unset
+#include? "Local.xcconfig"

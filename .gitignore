@@ -29,3 +29,11 @@ privmsg.log
 
 # docs files
 /docs
+
+# iPhone app: downloaded Tor, built Rust core, generated bindings, and this
+# copy's own bundle identifier (scripts/build-ios.sh makes them all)
+/ios/vendor/
+/ios/build/
+/ios/Privmsg/Generated/
+/ios/Local.xcconfig
+xcuserdata/

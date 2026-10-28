@@ -1,0 +1,79 @@
+# The Xcode project, for XcodeGen (`xcodegen generate` in this folder;
+# scripts/build-ios.sh does it). Privmsg.xcodeproj is generated from this
+# file: change this, not the project.
+name: Privmsg
+options:
+  bundleIdPrefix: app
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: Privmsg.xcconfig
+  Release: Privmsg.xcconfig
+targets:
+  Privmsg:
+    type: application
+    platform: iOS
+    sources:
+      - path: Privmsg
+    dependencies:
+      # The Rust core and its Swift bindings (scripts/build-ios.sh).
+      - framework: build/PrivmsgCore.xcframework
+        embed: false
+      - sdk: libz.tbd
+      - sdk: libresolv.tbd
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+    info:
+      path: Privmsg/Info.plist
+      properties:
+        CFBundleDisplayName: $(APP_DISPLAY_NAME)
+        CFBundleShortVersionString: "0.2.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        ITSAppUsesNonExemptEncryption: false
+        NSCameraUsageDescription: "To scan a friend's invite code. The picture never leaves your phone."
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: false
+        ENABLE_USER_SCRIPT_SANDBOXING: true
+        # The Rust core is built for Apple-silicon simulators only.
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+        DEAD_CODE_STRIPPING: true
+        CODE_SIGN_STYLE: Automatic
+  PrivmsgUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: PrivmsgUITests
+    dependencies:
+      - target: Privmsg
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        SWIFT_VERSION: "5.0"
+        PRODUCT_BUNDLE_IDENTIFIER: $(inherited).uitests
+        EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+schemes:
+  Privmsg:
+    build:
+      targets:
+        Privmsg: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - PrivmsgUITests
+    archive:
+      config: Release

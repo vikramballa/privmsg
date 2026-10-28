@@ -23,15 +23,23 @@ use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};
+use openmls_traits::random::OpenMlsRand;
+use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize, Serialize};
 
 /// The mandatory-to-implement ciphersuite: X25519 + AES-128-GCM + SHA-256 + Ed25519.
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 /// One participant's long-lived crypto state: the OpenMLS provider (key
-/// store + crypto backend) plus this identity's signature keypair and
+/// store + crypto backend) plus an original signature keypair and
 /// credential. In a real client the provider is backed by SQLCipher on
 /// disk; here it is in-memory.
+///
+/// Unlinkability: every key package and every group we create gets a fresh
+/// signature key and a fresh random credential label (a *persona*), kept in
+/// the same store. Contacts, or anyone holding two of our invites, see
+/// nothing in MLS that ties our conversations together. The original
+/// signer only remains for groups made before personas existed.
 pub struct Identity {
     pub provider: OpenMlsRustCrypto,
     pub signer: SignatureKeyPair,
@@ -71,16 +79,44 @@ impl Identity {
     }
 
     fn assemble(provider: OpenMlsRustCrypto, signer: SignatureKeyPair, label: Vec<u8>) -> Self {
-        let credential = CredentialWithKey {
-            credential: BasicCredential::new(label.clone()).into(),
-            signature_key: signer.public().into(),
-        };
+        let credential = credential(label.clone(), &signer);
         Self {
             provider,
             signer,
             credential,
             label,
         }
+    }
+
+    /// A fresh signature key and credential with a random label, stored so
+    /// that [`Identity::signer_for`] finds the key again after a restart.
+    fn new_persona(&self) -> Result<(SignatureKeyPair, CredentialWithKey)> {
+        let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm())
+            .map_err(|e| anyhow!("signature keypair: {e:?}"))?;
+        signer
+            .store(self.provider.storage())
+            .map_err(|e| anyhow!("store signer: {e:?}"))?;
+        let random = self
+            .provider
+            .rand()
+            .random_vec(16)
+            .map_err(|e| anyhow!("random label: {e:?}"))?;
+        let label = random
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let credential = credential(label.into_bytes(), &signer);
+        Ok((signer, credential))
+    }
+
+    /// The stored signature key whose public half is `public`.
+    fn signer_for(&self, public: &[u8]) -> Result<SignatureKeyPair> {
+        SignatureKeyPair::read(
+            self.provider.storage(),
+            public,
+            CIPHERSUITE.signature_algorithm(),
+        )
+        .ok_or_else(|| anyhow!("signature key for this conversation is missing"))
     }
 
     /// Serialize this identity, including every group it belongs to, so it
@@ -127,17 +163,20 @@ impl Identity {
     /// Publish a KeyPackage — the public artifact another party consumes
     /// to add us to a group. In Phase 1 we hand it over directly; later it
     /// is fetched through the metadata-private directory, never a lookup
-    /// that reveals who is adding whom.
+    /// that reveals who is adding whom. Each one carries a new persona.
     pub fn key_package(&self) -> Result<KeyPackage> {
+        let (signer, credential) = self.new_persona()?;
         let bundle = KeyPackage::builder()
-            .build(
-                CIPHERSUITE,
-                &self.provider,
-                &self.signer,
-                self.credential.clone(),
-            )
+            .build(CIPHERSUITE, &self.provider, &signer, credential)
             .map_err(|e| anyhow!("key package: {e:?}"))?;
         Ok(bundle.key_package().clone())
+    }
+}
+
+fn credential(label: Vec<u8>, signer: &SignatureKeyPair) -> CredentialWithKey {
+    CredentialWithKey {
+        credential: BasicCredential::new(label).into(),
+        signature_key: signer.public().into(),
     }
 }
 
@@ -158,7 +197,31 @@ pub fn decode_key_package(bytes: &[u8]) -> Result<KeyPackage> {
     if kp.ciphersuite() != CIPHERSUITE {
         return Err(anyhow!("unsupported ciphersuite {:?}", kp.ciphersuite()));
     }
+    // The leaf's key is only reachable through its encoding, which ends in
+    // the 32 key bytes.
+    let leaf_key = kp
+        .leaf_node()
+        .encryption_key()
+        .tls_serialize_detached()
+        .map_err(|e| anyhow!("encode leaf key: {e:?}"))?;
+    let tail = |b: &[u8]| b[b.len().saturating_sub(32)..].to_vec();
+    if !contributory(kp.hpke_init_key().as_slice()) || !contributory(&tail(&leaf_key)) {
+        return Err(anyhow!("invalid key package: weak encryption key"));
+    }
     Ok(kp)
+}
+
+/// Whether X25519 with `public` yields a secret that depends on our key.
+/// The low-order points make it all zeros for every private key, and
+/// hpke-rs 0.2 doesn't refuse them as RFC 9180 requires (RUSTSEC-2026-0072):
+/// a key package with one would have us encrypt the Welcome under a key
+/// anyone can compute.
+fn contributory(public: &[u8]) -> bool {
+    let Ok(point) = <[u8; 32]>::try_from(public) else {
+        return false;
+    };
+    // Clamping clears the cofactor, so any fixed scalar exposes them.
+    x25519_dalek::x25519([0x42; 32], point) != [0u8; 32]
 }
 
 /// Read the group id from an MLS protocol message without decrypting it, so
@@ -174,9 +237,11 @@ pub fn message_group_id(ciphertext: &[u8]) -> Result<Vec<u8>> {
     Ok(protocol_msg.group_id().as_slice().to_vec())
 }
 
-/// A live MLS session wrapping one `MlsGroup`.
+/// A live MLS session wrapping one `MlsGroup`, with the signature key of
+/// our leaf in it.
 pub struct Session {
     group: MlsGroup,
+    signer: SignatureKeyPair,
 }
 
 impl Session {
@@ -190,9 +255,10 @@ impl Session {
         let config = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
             .build();
-        let group = MlsGroup::new(&id.provider, &id.signer, &config, id.credential.clone())
+        let (signer, credential) = id.new_persona()?;
+        let group = MlsGroup::new(&id.provider, &signer, &config, credential)
             .map_err(|e| anyhow!("create group: {e:?}"))?;
-        Ok(Self { group })
+        Ok(Self { group, signer })
     }
 
     /// Reopen a group this identity already belongs to (e.g. after
@@ -201,7 +267,32 @@ impl Session {
         let group = MlsGroup::load(id.provider.storage(), &GroupId::from_slice(group_id))
             .map_err(|e| anyhow!("load group: {e:?}"))?
             .ok_or_else(|| anyhow!("no such group in storage"))?;
-        Ok(Self { group })
+        Self::with_own_signer(id, group)
+    }
+
+    /// Pair `group` with the stored key our leaf in it was signed with.
+    fn with_own_signer(id: &Identity, group: MlsGroup) -> Result<Self> {
+        let leaf = group
+            .own_leaf_node()
+            .ok_or_else(|| anyhow!("we are not a member of this group"))?;
+        let signer = id.signer_for(leaf.signature_key().as_slice())?;
+        Ok(Self { group, signer })
+    }
+
+    /// A number both people in this conversation see only if nobody sits
+    /// in the middle: derived from the group's epoch authenticator, which
+    /// covers both members' keys. Compare it in person or over a call.
+    pub fn safety_number(&self) -> String {
+        let digest = self.group.epoch_authenticator().as_slice();
+        digest
+            .chunks(3)
+            .take(6)
+            .map(|c| {
+                let n = c.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b));
+                format!("{:05}", n % 100_000)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// This group's id, used to route incoming messages.
@@ -225,7 +316,7 @@ impl Session {
     pub fn add_member(&mut self, id: &Identity, member_kp: KeyPackage) -> Result<Vec<u8>> {
         let (_commit, welcome, _group_info) = self
             .group
-            .add_members(&id.provider, &id.signer, &[member_kp])
+            .add_members(&id.provider, &self.signer, &[member_kp])
             .map_err(|e| anyhow!("add member: {e:?}"))?;
 
         self.group
@@ -272,7 +363,7 @@ impl Session {
         let group = staged
             .into_group(&id.provider)
             .map_err(|e| anyhow!("into group: {e:?}"))?;
-        Ok(Self { group })
+        Self::with_own_signer(id, group)
     }
 
     /// Encrypt an application message. The returned bytes are what crosses
@@ -280,7 +371,7 @@ impl Session {
     pub fn encrypt(&mut self, id: &Identity, plaintext: &[u8]) -> Result<Vec<u8>> {
         let out = self
             .group
-            .create_message(&id.provider, &id.signer, plaintext)
+            .create_message(&id.provider, &self.signer, plaintext)
             .map_err(|e| anyhow!("create message: {e:?}"))?;
         out.tls_serialize_detached()
             .map_err(|e| anyhow!("serialize message: {e:?}"))
@@ -430,11 +521,105 @@ mod tests {
             mallory.credential.clone(),
         )
         .map_err(|e| anyhow!("{e:?}"))?;
-        let mut evil = Session { group };
+        let signer = mallory.signer_for(mallory.signer.public())?;
+        let mut evil = Session { group, signer };
         let welcome = evil.add_member(&mallory, bob.key_package()?)?;
         let err = Session::join(&bob, &welcome).err().unwrap();
         assert!(err.to_string().contains("existing group"));
         assert!(Session::load(&bob, &a.group_id()).is_ok(), "untouched");
+        Ok(())
+    }
+
+    #[test]
+    fn invites_and_conversations_cannot_be_linked_by_key() -> Result<()> {
+        let bob = Identity::new("bob-local-label")?;
+        let (kp1, kp2) = (bob.key_package()?, bob.key_package()?);
+        let key = |kp: &KeyPackage| kp.leaf_node().signature_key().as_slice().to_vec();
+        let label = |kp: &KeyPackage| kp.leaf_node().credential().serialized_content().to_vec();
+        assert_ne!(key(&kp1), key(&kp2), "two invites, two keys");
+        assert_ne!(label(&kp1), label(&kp2), "and two labels");
+        assert_ne!(key(&kp1), bob.signer.public(), "not the original key");
+
+        // Two groups Bob starts himself use different keys too.
+        let (one, two) = (Session::create(&bob)?, Session::create(&bob)?);
+        let own = |s: &Session| {
+            s.group
+                .own_leaf_node()
+                .unwrap()
+                .signature_key()
+                .as_slice()
+                .to_vec()
+        };
+        assert_ne!(own(&one), own(&two));
+        Ok(())
+    }
+
+    #[test]
+    fn both_sides_see_the_same_safety_number() -> Result<()> {
+        let (_alice, a, _bob, b) = pair()?;
+        assert_eq!(a.safety_number(), b.safety_number());
+        assert_eq!(a.safety_number().len(), 6 * 5 + 5);
+        // A different conversation (say, with someone in the middle) differs.
+        let (_c, c, _d, _) = pair()?;
+        assert_ne!(a.safety_number(), c.safety_number());
+        Ok(())
+    }
+
+    #[test]
+    fn conversations_from_before_personas_still_work() -> Result<()> {
+        // Made the old way: Alice's group and Bob's key package both signed
+        // with the identity's original key.
+        let alice = Identity::new("alice-local-label")?;
+        let bob = Identity::new("bob-local-label")?;
+        let config = MlsGroupCreateConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+        let group = MlsGroup::new(
+            &alice.provider,
+            &alice.signer,
+            &config,
+            alice.credential.clone(),
+        )
+        .map_err(|e| anyhow!("{e:?}"))?;
+        let mut a = Session {
+            group,
+            signer: alice.signer_for(alice.signer.public())?,
+        };
+        let old_kp = KeyPackage::builder()
+            .build(
+                CIPHERSUITE,
+                &bob.provider,
+                &bob.signer,
+                bob.credential.clone(),
+            )
+            .map_err(|e| anyhow!("{e:?}"))?;
+        let welcome = a.add_member(&alice, old_kp.key_package().clone())?;
+        let b = Session::join(&bob, &welcome)?;
+
+        let group_id = a.group_id();
+        let alice = Identity::restore(&alice.snapshot()?)?;
+        let bob = Identity::restore(&bob.snapshot()?)?;
+        let (mut a, mut b) = (Session::load(&alice, &group_id)?, {
+            drop(b);
+            Session::load(&bob, &group_id)?
+        });
+        let ct = a.encrypt(&alice, b"still works")?;
+        assert_eq!(b.decrypt(&bob, &ct)?, b"still works");
+        let ct = b.encrypt(&bob, b"both ways")?;
+        assert_eq!(a.decrypt(&alice, &ct)?, b"both ways");
+        Ok(())
+    }
+
+    #[test]
+    fn low_order_keys_are_refused() -> Result<()> {
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert!(!contributory(&[0u8; 32]), "the zero point");
+        assert!(!contributory(&one), "a point of order 4");
+        assert!(!contributory(&[7u8; 31]), "wrong length");
+        let kp = Identity::new("x")?.key_package()?;
+        assert!(contributory(kp.hpke_init_key().as_slice()), "a real key");
+        assert!(decode_key_package(&encode_key_package(&kp)?).is_ok());
         Ok(())
     }
 

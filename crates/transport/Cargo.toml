@@ -28,6 +28,9 @@ tempfile = { workspace = true }
 # network and don't need to build (or link) the Nym tree.
 default = ["nym"]
 nym = ["dep:nym-sdk", "dep:nym-gateway-client", "dep:nym-http-api-client", "dep:reqwest", "dep:async-trait"]
+# Tor linked in as a library (`Tor::start_embedded`), for the iPhone app,
+# which can't start a tor program. Needs PRIVMSG_TOR_XCFRAMEWORK; see build.rs.
+embedded-tor = ["nym"]
 
 [dev-dependencies]
 nym-sphinx = { workspace = true }

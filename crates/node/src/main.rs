@@ -27,8 +27,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use privmsg_crypto::{Identity, Session};
 use privmsg_node::app::{describe_timer, parse_timer, Event, Node};
+pub(crate) use privmsg_node::clean;
 use privmsg_node::decoy::{self, Scheduler};
-use privmsg_node::store::{HistoryEntry, Profile, Settings};
+use privmsg_node::store::{HistoryEntry, Profile, Settings, MIN_PASSPHRASE};
 use privmsg_transport::{DataMode, Mux, NymNetwork, Tor};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::Instant;
@@ -54,6 +55,7 @@ commands:
   history <name>          show saved messages with <name>
   disappear <name> [off|5m|1h|1d|1w]
                           show or set disappearing messages with <name> (both sides)
+  verify <name>           show the safety number to compare with <name>
   rotate <name>           move the conversation with <name> to a new address
   remove <name>           forget a contact or unused invite and its addresses
   address                 show your mix address for each contact
@@ -131,6 +133,7 @@ async fn main() -> Result<()> {
         ["history", name] => history(data_dir, name),
         ["disappear", name] => disappear(data_dir, name, None).await,
         ["disappear", name, after] => disappear(data_dir, name, Some(after)).await,
+        ["verify", name] => verify(data_dir, name),
         ["rotate", name] => rotate(data_dir, name).await,
         ["remove", name] => remove(data_dir, name).await,
         ["decoys"] => decoys(data_dir, None),
@@ -220,20 +223,22 @@ fn open(dir: &Path) -> Result<Node> {
 /// offer to remember the passphrase in the keychain.
 fn setup(dir: &Path) -> Result<Node> {
     if let Ok(pass) = std::env::var("PRIVMSG_PASSPHRASE") {
-        if pass.chars().count() < 8 {
-            bail!("PRIVMSG_PASSPHRASE must be at least 8 characters");
+        if pass.chars().count() < MIN_PASSPHRASE {
+            bail!("PRIVMSG_PASSPHRASE must be at least {MIN_PASSPHRASE} characters");
         }
         return Node::create(dir, &pass);
     }
     eprintln!(
         "Welcome to privmsg!\n\n\
-         Choose a password (at least 8 characters). It locks your messages on\n\
-         this computer. It can't be recovered, so pick one you'll remember.\n"
+         Choose a password (at least 12 characters). It locks your messages on\n\
+         this computer. It can't be recovered, so pick one you'll remember.\n\
+         Tip: four random words, like \"maple cloud river tiger\", are strong\n\
+         and easy to remember.\n"
     );
     let pass = loop {
         let pass = Zeroizing::new(rpassword::prompt_password("Password: ")?);
-        if pass.chars().count() < 8 {
-            eprintln!("Please use at least 8 characters.");
+        if pass.chars().count() < MIN_PASSPHRASE {
+            eprintln!("Please use at least {MIN_PASSPHRASE} characters.");
             continue;
         }
         if *pass != *Zeroizing::new(rpassword::prompt_password("Type it again: ")?) {
@@ -437,6 +442,22 @@ async fn disappear(dir: PathBuf, name: &str, after: Option<&str>) -> Result<()> 
             describe_timer(Some(secs))
         ),
     }
+    Ok(())
+}
+
+fn verify(dir: PathBuf, name: &str) -> Result<()> {
+    let node = open(&dir)?;
+    println!(
+        "Safety number with {}:\n\n    {}\n",
+        clean(name),
+        node.safety_number(name)?
+    );
+    println!(
+        "Compare it with {} in person or on a call (not in a chat app). If it\n\
+         matches, nobody intercepted your invite. If it doesn't, remove the\n\
+         contact and connect again with a new invite.",
+        clean(name)
+    );
     Ok(())
 }
 
@@ -763,22 +784,6 @@ fn print_entry(name: &str, entry: &HistoryEntry) {
     println!("[{}] {}: {}", utc(entry.at), clean(who), clean(&entry.text));
 }
 
-/// Strip control characters so a contact can't send terminal escape
-/// sequences that rewrite the screen, and bidirectional overrides that make
-/// text display in a different order than it was written.
-pub(crate) fn clean(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            let bidi = matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
-            if c.is_control() || bidi {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
 /// `YYYY-MM-DD HH:MM` in UTC (days-from-civil, Howard Hinnant's algorithm).
 pub(crate) fn utc(unix: u64) -> String {
     let (days, secs) = ((unix / 86_400) as i64, unix % 86_400);
@@ -814,6 +819,7 @@ mod tests {
         assert_eq!(clean("hi\x1b[2Jthere\n"), "hi\u{FFFD}[2Jthere\u{FFFD}");
         assert_eq!(clean("ünïcödé ok"), "ünïcödé ok");
         assert_eq!(clean("abc\u{202E}fed"), "abc\u{FFFD}fed", "bidi override");
+        assert_eq!(clean("a\u{061C}b"), "a\u{FFFD}b", "Arabic letter mark");
     }
 
     #[test]
