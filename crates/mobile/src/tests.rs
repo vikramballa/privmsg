@@ -287,3 +287,43 @@ fn timer_choices_start_with_off() {
     assert_eq!(choices[0].label, "off");
     assert_eq!(choices.len(), TIMERS.len() + 1);
 }
+
+/// The real network: join a desktop's invite (`INVITE_CODE`) and send it
+/// six messages, 20 s apart, through the same loop the phone runs (with
+/// `WAIT_FOR_REPLY` set, waiting after the first for one from the desktop).
+/// Tor comes from `PRIVMSG_TOR` unless built with `embedded-tor`. Run with
+/// `cargo test -p privmsg-mobile live_sends -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the live network and a desktop invite"]
+async fn live_sends_several_messages() {
+    let code = std::env::var("INVITE_CODE").expect("set INVITE_CODE");
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let phone = Messenger::create(
+        dir.path().to_string_lossy().into(),
+        "correct horse battery".into(),
+        recorder.clone(),
+    )
+    .unwrap();
+    until_for("online", Duration::from_secs(300), || {
+        phone.status() == ConnectionStatus::Online
+    })
+    .await;
+    phone.accept_invite(code, "desk".into()).await.unwrap();
+    for i in 1..=6 {
+        phone
+            .send("desk".into(), format!("phone msg {i}"))
+            .await
+            .unwrap();
+        eprintln!("sent phone msg {i}; status {:?}", phone.status());
+        if i == 1 && std::env::var_os("WAIT_FOR_REPLY").is_some() {
+            until_for("the desktop's reply", Duration::from_secs(600), || {
+                phone.messages("desk".into()).iter().any(|m| !m.outgoing)
+            })
+            .await;
+            eprintln!("got the reply");
+        }
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
+    phone.shutdown().await;
+}

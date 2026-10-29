@@ -22,6 +22,11 @@ use crate::{pad, unpad, DataMode, IncomingMessage, MixAddress, Network, Tor, Tra
 /// Gateways a new address tries before giving up.
 const NEW_ADDRESS_TRIES: u32 = 3;
 
+/// How long one attempt to reach the mixnet may take. Through Tor it
+/// usually takes 10–30 s; a gateway that never answers would otherwise
+/// hang forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Directory of the sender's keys. Slot names are random hex, so they
 /// can't collide with it.
 const SENDER_DIR: &str = "sender";
@@ -144,14 +149,21 @@ impl NymNetwork {
         }
         // No collector is configured anyway; make sure nothing is reported.
         debug.stats_reporting.enabled = false;
-        let client = MixnetClientBuilder::new_with_default_storage(paths)
+        let connecting = MixnetClientBuilder::new_with_default_storage(paths)
             .await?
             .debug_config(debug)
             .force_tls(self.tor.is_some())
             .custom_topology_provider(Box::new(self.topology.clone()))
             .build()?
-            .connect_to_mixnet()
+            .connect_to_mixnet();
+        let client = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
             .await
+            .map_err(|_| {
+                anyhow!(
+                    "the gateway did not answer within {} s",
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
             .context("connect to the Nym mixnet")?;
         Ok(NymTransport {
             client,
@@ -247,9 +259,13 @@ impl NymTransport {
         }
     }
 
-    /// Flush pending sends, then close the connection to the gateway.
+    /// Flush pending sends, if anything was sent, then close the
+    /// connection to the gateway. A slot (which never sends) closes at
+    /// once, so it stops taking in messages nothing will read.
     pub async fn disconnect(self) {
-        self.flush(Duration::from_secs(30)).await;
+        if self.last_send.is_some() {
+            self.flush(Duration::from_secs(30)).await;
+        }
         self.client.disconnect().await;
     }
 }
@@ -301,6 +317,10 @@ impl Transport for NymTransport {
 
     async fn close(self) {
         self.disconnect().await;
+    }
+
+    fn is_alive(&self) -> bool {
+        !self.client.cancellation_token().is_cancelled()
     }
 }
 

@@ -34,6 +34,11 @@ use view::View;
 
 uniffi::setup_scaffolding!();
 
+/// Stack for the messenger's threads. The mixnet client's futures are
+/// large (several MB unoptimised), more than the 2 MB a thread gets by
+/// default; the desktop runs them on the 8 MB main thread.
+const STACK_SIZE: usize = 8 << 20;
+
 /// Default log filter, as on the desktop: warnings, minus Nym's routine
 /// noise on disconnect. Logs go to stderr (Xcode's console), never a file.
 const DEFAULT_LOG: &str =
@@ -409,6 +414,7 @@ impl Messenger {
         let thread_shared = shared.clone();
         std::thread::Builder::new()
             .name("privmsg".into())
+            .stack_size(STACK_SIZE)
             .spawn(move || {
                 let node = if create {
                     Node::create(&dir, &passphrase)
@@ -419,6 +425,7 @@ impl Messenger {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .thread_name("privmsg-worker")
+                    .thread_stack_size(STACK_SIZE)
                     .build()
                     .map_err(anyhow::Error::from);
                 let (node, runtime) = match (node, runtime) {
@@ -431,7 +438,7 @@ impl Messenger {
                 {
                     // So the app has contacts and messages to show at once.
                     let mut view = thread_shared.view.lock().expect("view lock");
-                    view.refresh(&node, 0);
+                    view.refresh(&node);
                     view.status = if node.settings().tor {
                         ConnectionStatus::StartingTor { percent: 0 }
                     } else {

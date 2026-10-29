@@ -91,6 +91,13 @@ pub trait Transport {
 
     /// Hand off anything still queued, then go offline.
     fn close(self) -> impl Future<Output = ()> + Send;
+
+    /// Whether the connection is still usable. Nym shuts a client down by
+    /// itself once its gateway stops answering; a dead sender would take
+    /// messages and never deliver them.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 /// Opens endpoints by slot name. Each slot has its own keys, so its own
@@ -174,11 +181,33 @@ impl<N: Network> Mux<N> {
             .collect())
     }
 
-    /// Send through the sender, waking it first if needed.
+    /// Send through the sender, waking it first if needed. A sender that
+    /// died (or fails to take the message) is replaced and the send tried
+    /// once more, so nothing is handed to a dead connection.
     pub async fn send(&mut self, to: &MixAddress, payload: &[u8]) -> Result<()> {
+        if self.sender.as_ref().is_some_and(|s| !s.is_alive()) {
+            tracing::warn!("the sender's connection died; opening a new one");
+            self.replace_sender().await;
+        }
         self.wake().await?;
         let sender = self.sender.as_mut().expect("awake");
-        sender.send(to, payload).await
+        match sender.send(to, payload).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!("sending failed ({e:#}); trying again on a new connection");
+                self.replace_sender().await;
+                self.wake().await?;
+                self.sender.as_mut().expect("awake").send(to, payload).await
+            }
+        }
+    }
+
+    /// Drop the sender (it is broken); the next `wake` opens a new one.
+    async fn replace_sender(&mut self) {
+        if let Some(old) = self.sender.take() {
+            // A broken connection may never finish closing.
+            let _ = tokio::time::timeout(Duration::from_secs(5), old.close()).await;
+        }
     }
 
     /// Bring the sender online if it isn't.
@@ -228,10 +257,14 @@ impl<N: Network> Mux<N> {
         self.net.forget(slot)
     }
 
-    /// Flush and close every endpoint.
+    /// Flush and close every endpoint: the slots first, since a slot
+    /// still open while the sender flushes (seconds) would take in messages
+    /// that nothing reads any more, and they would be lost.
     pub async fn close(self) {
-        let endpoints = self.open.into_iter().map(|(_, e)| e).chain(self.sender);
-        futures::future::join_all(endpoints.map(Transport::close)).await;
+        futures::future::join_all(self.open.into_iter().map(|(_, e)| e.close())).await;
+        if let Some(sender) = self.sender {
+            sender.close().await;
+        }
     }
 
     /// Close every connection but keep the network (and its Tor), for when
@@ -239,13 +272,15 @@ impl<N: Network> Mux<N> {
     /// asleep. [`open`](Self::open) brings slots back on the same addresses.
     /// Connections that don't close within `timeout` are dropped.
     pub async fn reset(&mut self, timeout: Duration) {
-        let endpoints: Vec<N::Endpoint> = self
-            .open
-            .drain(..)
-            .map(|(_, e)| e)
-            .chain(self.sender.take())
-            .collect();
-        let closing = futures::future::join_all(endpoints.into_iter().map(Transport::close));
+        // Slots first, as in `close`.
+        let slots: Vec<N::Endpoint> = self.open.drain(..).map(|(_, e)| e).collect();
+        let sender = self.sender.take();
+        let closing = async {
+            futures::future::join_all(slots.into_iter().map(Transport::close)).await;
+            if let Some(sender) = sender {
+                sender.close().await;
+            }
+        };
         if tokio::time::timeout(timeout, closing).await.is_err() {
             tracing::warn!("some connections did not close in time; dropped them");
         }
@@ -387,7 +422,7 @@ pub fn unpad(frame: &[u8]) -> Result<Vec<u8>> {
 /// with the same padding as the mixnet. Like a Nym gateway, it queues
 /// messages for an address that is offline and delivers them on reconnect.
 pub mod memory {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -402,9 +437,20 @@ pub mod memory {
     pub struct MemoryNetwork {
         inboxes: Arc<Mutex<HashMap<String, Inbox>>>,
         senders: Arc<AtomicUsize>,
+        dead: Arc<Mutex<HashSet<String>>>,
     }
 
     impl MemoryNetwork {
+        /// Make `addr`'s connection die the way a Nym client can: it stops
+        /// delivering what it is given and reports itself dead.
+        pub fn kill(&self, addr: &str) {
+            self.dead.lock().unwrap().insert(addr.to_string());
+        }
+
+        fn is_dead(&self, addr: &str) -> bool {
+            self.dead.lock().unwrap().contains(addr)
+        }
+
         fn sender(&self, addr: &str) -> UnboundedSender<Vec<u8>> {
             let mut inboxes = self.inboxes.lock().unwrap();
             let (tx, _) = inboxes.entry(addr.to_string()).or_insert_with(|| {
@@ -476,6 +522,9 @@ pub mod memory {
 
         async fn send(&mut self, to: &MixAddress, payload: &[u8]) -> Result<()> {
             let frame = pad(payload)?;
+            if self.net.is_dead(&self.addr) {
+                return Ok(()); // taken, never delivered
+            }
             self.net
                 .sender(&to.0)
                 .send(frame)
@@ -496,6 +545,10 @@ pub mod memory {
         }
 
         async fn close(self) {}
+
+        fn is_alive(&self) -> bool {
+            !self.net.is_dead(&self.addr)
+        }
     }
 }
 
@@ -573,6 +626,25 @@ mod tests {
 
         mux.forget("one").await?;
         assert!(!mux.is_open("one") && mux.is_open("two"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_dead_sender_is_replaced_before_it_loses_a_message() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let mut mux = Mux::new(net.clone());
+        let mut peer = net.connect("peer")?;
+        let peer_addr = MixAddress("peer".into());
+        mux.send(&peer_addr, b"first").await?;
+        assert_eq!(peer.recv().await?.payload, b"first");
+
+        net.kill("sender-0");
+        mux.send(&peer_addr, b"second").await?;
+        assert_eq!(
+            peer.recv().await?.payload,
+            b"second",
+            "sent on a new sender"
+        );
         Ok(())
     }
 

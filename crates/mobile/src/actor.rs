@@ -143,12 +143,8 @@ impl Shared {
     }
 
     /// Refresh the view from `node`; tell the app if anything changed.
-    fn publish(&self, node: &Node, scheduler: Option<&Scheduler>) {
-        let changed = self
-            .view
-            .lock()
-            .expect("view lock")
-            .refresh(node, scheduler.map_or(0, Scheduler::queued));
+    fn publish(&self, node: &Node) {
+        let changed = self.view.lock().expect("view lock").refresh(node);
         if changed {
             self.listener.changed();
         }
@@ -179,8 +175,8 @@ pub(crate) async fn run<N, F, Fut>(
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<N>>,
 {
-    let mut scheduler = new_scheduler(&node);
-    shared.publish(&node, scheduler.as_ref());
+    let mut scheduler = new_scheduler(&mut node);
+    shared.publish(&node);
 
     // The network. Nothing borrows the node while it comes up.
     let net = loop {
@@ -190,7 +186,7 @@ pub(crate) async fn run<N, F, Fut>(
             tokio::select! {
                 result = &mut making => break result,
                 cmd = commands.recv() => match local(&mut node, cmd, "starting Tor") {
-                    ControlFlow::Continue(()) => shared.publish(&node, scheduler.as_ref()),
+                    ControlFlow::Continue(()) => shared.publish(&node),
                     ControlFlow::Break(stop) => return finish(stop, &shared),
                 },
             }
@@ -200,7 +196,7 @@ pub(crate) async fn run<N, F, Fut>(
             Err(e) => {
                 tracing::warn!("network did not start: {e:#}");
                 if let ControlFlow::Break(stop) =
-                    wait_to_retry(&mut node, scheduler.as_ref(), &shared, &mut commands, &e).await
+                    wait_to_retry(&mut node, &shared, &mut commands, &e).await
                 {
                     return finish(stop, &shared);
                 }
@@ -248,8 +244,7 @@ pub(crate) async fn run<N, F, Fut>(
             Some(Err(e)) => {
                 tracing::warn!("could not connect: {e:#}");
                 mux.reset(CLOSE_TIMEOUT).await;
-                match wait_to_retry(&mut node, scheduler.as_ref(), &shared, &mut commands, &e).await
-                {
+                match wait_to_retry(&mut node, &shared, &mut commands, &e).await {
                     ControlFlow::Continue(()) => continue 'session,
                     ControlFlow::Break(stop) => break 'session stop,
                 }
@@ -271,12 +266,8 @@ pub(crate) async fn run<N, F, Fut>(
         }
     };
 
-    if let Some(s) = scheduler.as_mut() {
-        for (name, text) in s.drain() {
-            if let Err(e) = node.send_text(&mut mux, &name, &text).await {
-                tracing::warn!("queued message to {name} not sent: {e:#}");
-            }
-        }
+    if let Err(e) = node.send_held(&mut mux).await {
+        tracing::warn!("not everything waiting for a decoy was sent: {e:#}");
     }
     mux.close().await;
     finish(stop, &shared);
@@ -295,7 +286,7 @@ async fn online<N: Network>(
         tokio::time::interval_at(Instant::now() + MAINTENANCE_EVERY, MAINTENANCE_EVERY);
     let mut last_active = Instant::now();
     loop {
-        shared.publish(node, scheduler.as_ref());
+        shared.publish(node);
 
         let next_tick = scheduler.as_ref().and_then(Scheduler::next_due);
         let tick_at = next_tick.as_ref().map_or_else(far_future, |(_, at)| *at);
@@ -349,18 +340,10 @@ async fn online<N: Network>(
             }
             _ = tokio::time::sleep_until(tick_at), if next_tick.is_some() => {
                 let (name, _) = next_tick.expect("tick scheduled");
-                let s = scheduler.as_mut().expect("decoys on");
-                match s.tick(&name) {
-                    Some(text) => {
-                        if let Err(e) = node.send_text(mux, &name, &text).await {
-                            shared.notice(format!("A message to {} was not sent: {e:#}", clean(&name)));
-                        }
-                    }
-                    None => {
-                        if let Err(e) = node.send_decoy(mux, &name).await {
-                            tracing::warn!("decoy to {name} not sent: {e:#}");
-                        }
-                    }
+                scheduler.as_mut().expect("decoys on").tick(&name);
+                // The oldest frame held for them, or a decoy.
+                if let Err(e) = node.tick(mux, &name).await {
+                    tracing::warn!("decoy tick for {name} not sent: {e:#}");
                 }
             }
             _ = maintenance.tick() => {
@@ -412,10 +395,8 @@ async fn command<N: Network>(
                     text.len()
                 ))
             } else {
-                match scheduler.as_mut() {
-                    Some(s) => node.contact(&name).map(|_| s.queue(&name, text)),
-                    None => node.send_text(mux, &name, &text).await,
-                }
+                // With decoys on, held for the next tick.
+                node.send_text(mux, &name, &text).await
             };
             drop(reply.send(result));
         }
@@ -440,15 +421,8 @@ async fn command<N: Network>(
             let result = node.set_settings(settings);
             if result.is_ok() && node.settings().decoy_interval != decoys_before {
                 // Send what decoys were holding back before changing the clock.
-                if let Some(mut s) = scheduler.take() {
-                    for (name, text) in s.drain() {
-                        if let Err(e) = node.send_text(mux, &name, &text).await {
-                            shared.notice(format!(
-                                "A message to {} was not sent: {e:#}",
-                                clean(&name)
-                            ));
-                        }
-                    }
+                if let Err(e) = node.send_held(mux).await {
+                    shared.notice(format!("Something waiting for a decoy was not sent: {e:#}"));
                 }
                 *scheduler = new_scheduler(node);
             }
@@ -511,7 +485,6 @@ fn local(
 /// retry, or comes back on screen), answering commands meanwhile.
 async fn wait_to_retry(
     node: &mut Node,
-    scheduler: Option<&Scheduler>,
     shared: &Shared,
     commands: &mut UnboundedReceiver<Command>,
     error: &anyhow::Error,
@@ -530,7 +503,7 @@ async fn wait_to_retry(
                 if let ControlFlow::Break(stop) = local(node, cmd, "offline") {
                     return ControlFlow::Break(stop);
                 }
-                shared.publish(node, scheduler);
+                shared.publish(node);
                 if now {
                     return ControlFlow::Continue(());
                 }
@@ -571,13 +544,14 @@ fn announce(shared: &Shared, scheduler: &mut Option<Scheduler>, event: Event) {
     }
 }
 
-fn new_scheduler(node: &Node) -> Option<Scheduler> {
-    node.settings().decoy_interval.map(|secs| {
-        Scheduler::new(
-            Duration::from_secs(secs.into()),
-            node.contacts().iter().map(|c| c.name.clone()),
-        )
-    })
+/// With decoys on: their clocks, and the node holding every frame for them.
+fn new_scheduler(node: &mut Node) -> Option<Scheduler> {
+    let secs = node.settings().decoy_interval?;
+    node.hold_for_decoys();
+    Some(Scheduler::new(
+        Duration::from_secs(secs.into()),
+        node.contacts().iter().map(|c| c.name.clone()),
+    ))
 }
 
 /// Longest contact name, in characters.

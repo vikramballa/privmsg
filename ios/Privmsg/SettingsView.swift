@@ -26,7 +26,7 @@ struct SettingsView: View {
                 }
                 Section("Good to know") {
                     Text("There are no notifications: they would go through Apple. Open the app to get your messages; the network keeps them for about a day while you're away.")
-                    Text("Only Apple's keyboard works in privmsg, and copied invite codes stay on this phone for 3 minutes.")
+                    Text("Only Apple's keyboard works in privmsg, and copied invite codes and messages stay on this phone for 3 minutes.")
                 }
                 if let error {
                     Section { Text(error).foregroundStyle(.red) }
@@ -92,7 +92,7 @@ struct SettingsView: View {
         } header: {
             Text("Extra privacy")
         } footer: {
-            Text("Decoys: each chat sends a message every 10 seconds or so, real or fake, so nobody can tell when you're actually talking. Your messages wait for the next one. Resting stops sending (not receiving) after a while without typing, to save data; decoys keep it awake.")
+            Text("Decoys: each chat sends a message every 10 seconds or so, real or fake, so nobody can tell when you're actually talking. Your messages (and deletes and other changes) wait for the next one. Resting stops sending (not receiving) after a while without typing, to save data; decoys keep it awake.")
         }
     }
 

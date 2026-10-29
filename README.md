@@ -360,8 +360,9 @@ keys are deleted.
 
 `privmsg decoys on` makes each conversation send
 something at random moments (every ~10 s on average) whenever you're in
-`ui`, `chat` or `listen`. That's either a waiting message or a meaningless
-decoy, so someone counting packets can't tell when you actually write.
+`ui`, `chat` or `listen`. That's either something waiting (a message, a delete, a timer or
+address change) or a meaningless decoy, so someone counting packets
+can't tell when you actually do anything.
 The cost is bandwidth and a delay of a few seconds per message.
 `privmsg decoys 30` picks a different average; `privmsg decoys off` turns
 them off. A one-off `privmsg send` always goes out immediately.

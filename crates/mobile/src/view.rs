@@ -21,7 +21,7 @@ pub(crate) struct View {
 
 impl View {
     /// Copy the current state out of `node`. Whether anything changed.
-    pub fn refresh(&mut self, node: &Node, queued: usize) -> bool {
+    pub fn refresh(&mut self, node: &Node) -> bool {
         let mut contacts: Vec<ContactInfo> = node.contacts().iter().map(contact).collect();
         // Most recent conversation first; new ones (no messages) on top.
         contacts.sort_by_key(|c| std::cmp::Reverse(c.last_at.unwrap_or(u64::MAX)));
@@ -32,7 +32,7 @@ impl View {
             .collect();
         let invites: Vec<String> = node.invites().iter().map(|i| i.name.clone()).collect();
         let settings = settings(node.settings());
-        let queued = queued as u32;
+        let queued = node.queued() as u32;
 
         let changed = contacts != self.contacts
             || messages != self.messages

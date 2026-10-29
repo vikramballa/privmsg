@@ -5,7 +5,7 @@
 //! `state.enc`, sealed with a key derived from the user's passphrase:
 //!
 //! ```text
-//! "PRIVMSG6" | KDF cost (12) | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
+//! "PRIVMSG7" | KDF cost (12) | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
 //! ```
 //!
 //! The key is Argon2id(passphrase, salt) with the cost in the header
@@ -21,7 +21,8 @@
 //! the defaults. Version 3 profiles (`"PRIVMSG3"`) lack disappearing
 //! messages and auto-sleep, which start off. Versions 4 and 5
 //! (`"PRIVMSG4"`, `"PRIVMSG5"`) have no message IDs: their messages get
-//! local ones, so they can be deleted here but not for both sides. Versions 1–4 used the Argon2
+//! local ones, so they can be deleted here but not for both sides. Version 6
+//! (`"PRIVMSG6"`) lacks the replay list, which starts empty. Versions 1–4 used the Argon2
 //! crate's default cost and no cost field; they are re-keyed at [`KDF`] when
 //! opened.
 //!
@@ -44,7 +45,8 @@ use zeroize::Zeroizing;
 
 use crate::wire::MessageId;
 
-const MAGIC: &[u8; 8] = b"PRIVMSG6";
+const MAGIC: &[u8; 8] = b"PRIVMSG7";
+const MAGIC_V6: &[u8; 8] = b"PRIVMSG6";
 const MAGIC_V5: &[u8; 8] = b"PRIVMSG5";
 const MAGIC_V4: &[u8; 8] = b"PRIVMSG4";
 const MAGIC_V3: &[u8; 8] = b"PRIVMSG3";
@@ -84,6 +86,9 @@ pub const HISTORY_LIMIT: usize = 500;
 
 /// Deletions remembered per contact for messages that have not arrived yet.
 pub const GONE_LIMIT: usize = 64;
+
+/// Messages remembered per contact to refuse replays (see `Contact::seen`).
+pub const SEEN_LIMIT: usize = 1000;
 
 /// The slot a version 1 profile's single address was moved to.
 pub const LEGACY_SLOT: &str = "legacy";
@@ -161,6 +166,11 @@ pub struct Contact {
     /// When the contact last emptied the chat for both of us, if they did
     /// since we last emptied it ourselves (Unix seconds).
     pub cleared_by_them: Option<u64>,
+    /// IDs of the messages received since we last sent one, to refuse a
+    /// replay of any of them. OpenMLS 0.6 saves its record of used keys
+    /// when we encrypt, not when we decrypt, so after a restart those
+    /// messages would decrypt again.
+    pub seen: Vec<MessageId>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -189,6 +199,64 @@ pub struct HistoryEntry {
     /// (`wire::message_id`). Messages from before version 6 have a random
     /// local one, so they can only be deleted on this side.
     pub shared: bool,
+}
+
+/// The state layout of version 6: no replay list.
+mod v6 {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct State {
+        pub identity: Vec<u8>,
+        pub contacts: Vec<Contact>,
+        pub invites: Vec<super::PendingInvite>,
+        pub pending: Vec<super::PendingMessage>,
+        pub settings: super::Settings,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Contact {
+        pub name: String,
+        pub group_id: Vec<u8>,
+        pub address: String,
+        pub slot: super::Slot,
+        pub old_slots: Vec<super::OldSlot>,
+        pub rotated_at: u64,
+        pub history: Vec<super::HistoryEntry>,
+        pub unread: u32,
+        pub disappear_after: Option<u64>,
+        pub gone: Vec<super::MessageId>,
+        pub cleared_by_them: Option<u64>,
+    }
+}
+
+impl From<v6::State> for State {
+    fn from(old: v6::State) -> Self {
+        State {
+            identity: old.identity,
+            contacts: old
+                .contacts
+                .into_iter()
+                .map(|c| Contact {
+                    name: c.name,
+                    group_id: c.group_id,
+                    address: c.address,
+                    slot: c.slot,
+                    old_slots: c.old_slots,
+                    rotated_at: c.rotated_at,
+                    history: c.history,
+                    unread: c.unread,
+                    disappear_after: c.disappear_after,
+                    gone: c.gone,
+                    cleared_by_them: c.cleared_by_them,
+                    seen: Vec::new(),
+                })
+                .collect(),
+            invites: old.invites,
+            pending: old.pending,
+            settings: old.settings,
+        }
+    }
 }
 
 /// The state layout of versions 4 and 5: no message IDs.
@@ -262,6 +330,7 @@ impl From<v5::State> for State {
                     disappear_after: c.disappear_after,
                     gone: Vec::new(),
                     cleared_by_them: None,
+                    seen: Vec::new(),
                 })
                 .collect(),
             invites: old.invites,
@@ -330,6 +399,7 @@ impl From<v3::Contact> for Contact {
             disappear_after: None,
             gone: Vec::new(),
             cleared_by_them: None,
+            seen: Vec::new(),
         }
     }
 }
@@ -431,6 +501,7 @@ impl From<v1::State> for State {
                     disappear_after: None,
                     gone: Vec::new(),
                     cleared_by_them: None,
+                    seen: Vec::new(),
                 })
                 .collect(),
             invites: old
@@ -514,15 +585,22 @@ impl Profile {
         let lock = lock(dir)?;
         let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let current = data.starts_with(MAGIC);
+        let version_6 = data.starts_with(MAGIC_V6);
         let version_5 = data.starts_with(MAGIC_V5);
         let version_1 = data.starts_with(MAGIC_V1);
         let version_2 = data.starts_with(MAGIC_V2);
         let version_3 = data.starts_with(MAGIC_V3);
         let version_4 = data.starts_with(MAGIC_V4);
-        let has_cost = current || version_5;
+        let has_cost = current || version_6 || version_5;
         let header_len = if has_cost { HEADER_LEN } else { OLD_HEADER_LEN };
         if data.len() < header_len + NONCE_LEN
-            || !(current || version_5 || version_4 || version_3 || version_2 || version_1)
+            || !(current
+                || version_6
+                || version_5
+                || version_4
+                || version_3
+                || version_2
+                || version_1)
         {
             bail!("{} is not a privmsg profile", path.display());
         }
@@ -562,8 +640,13 @@ impl Profile {
             profile.key = derive_key(KDF, passphrase, &profile.salt)?;
             profile.kdf = KDF;
         }
-        if version_2 || version_3 || version_4 || version_5 {
-            let state = if version_4 || version_5 {
+        if version_2 || version_3 || version_4 || version_5 || version_6 {
+            let state = if version_6 {
+                State::from(
+                    bincode::deserialize::<v6::State>(&plaintext)
+                        .context("decode profile state")?,
+                )
+            } else if version_4 || version_5 {
                 State::from(
                     bincode::deserialize::<v5::State>(&plaintext)
                         .context("decode profile state")?,
@@ -580,7 +663,7 @@ impl Profile {
                 )
             };
             profile.save(&state)?;
-            tracing::info!("upgraded profile to version 6");
+            tracing::info!("upgraded profile to version 7");
             return Ok((profile, state));
         }
         if !version_1 {
@@ -603,7 +686,7 @@ impl Profile {
         }
         let state = State::from(old);
         profile.save(&state)?;
-        tracing::info!("upgraded profile to version 6");
+        tracing::info!("upgraded profile to version 7");
         Ok((profile, state))
     }
 
@@ -789,6 +872,7 @@ mod tests {
                 disappear_after: Some(3600),
                 gone: vec![],
                 cleared_by_them: None,
+                seen: vec![],
             }],
             invites: vec![],
             pending: vec![],
@@ -1047,28 +1131,76 @@ mod tests {
     }
 
     #[test]
-    fn version_5_messages_get_local_ids() -> Result<()> {
+    fn version_6_profile_starts_with_an_empty_replay_list() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut old = sample_state();
-        let entry = old.contacts[0].history[0].clone();
-        old.contacts[0].history.push(entry);
+        old.contacts[0].gone = vec![[4; 16]];
+        let contacts: Vec<_> = old
+            .contacts
+            .into_iter()
+            .map(|c| {
+                (
+                    c.name,
+                    c.group_id,
+                    c.address,
+                    c.slot,
+                    c.old_slots,
+                    c.rotated_at,
+                    c.history,
+                    c.unread,
+                    c.disappear_after,
+                    c.gone,
+                    c.cleared_by_them,
+                )
+            })
+            .collect();
+        let v6 = bincode::serialize(&(
+            old.identity,
+            contacts,
+            old.invites,
+            old.pending,
+            old.settings,
+        ))?;
+        write_with_cost(MAGIC_V6, dir.path(), "pw", &v6)?;
+
+        let (profile, state) = Profile::open(dir.path(), "pw")?;
+        let bob = &state.contacts[0];
+        assert_eq!(bob.history[0].id, [8; 16]);
+        assert_eq!(bob.gone, [[4; 16]]);
+        assert!(bob.seen.is_empty());
+        drop(profile);
+        let raw = fs::read(dir.path().join(STATE_FILE))?;
+        assert!(raw.starts_with(MAGIC), "rewritten as the current version");
+        Ok(())
+    }
+
+    /// Write `state` under `magic` with a cost field, as versions 5 and up do.
+    fn write_with_cost(magic: &[u8; 8], dir: &Path, passphrase: &str, state: &[u8]) -> Result<()> {
         let (salt, kdf) = ([5u8; SALT_LEN], KDF);
-        let key = derive_key(kdf, "pw", &salt)?;
-        let header = [MAGIC_V5.as_slice(), &kdf.encode(), &salt].concat();
+        let key = derive_key(kdf, passphrase, &salt)?;
+        let header = [magic.as_slice(), &kdf.encode(), &salt].concat();
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let ct = XChaCha20Poly1305::new(key.as_ref().into())
             .encrypt(
                 &nonce,
                 Payload {
-                    msg: &v5_state(old),
+                    msg: state,
                     aad: &header,
                 },
             )
             .map_err(|_| anyhow!("encrypt"))?;
-        fs::write(
-            dir.path().join(STATE_FILE),
-            [header, nonce.to_vec(), ct].concat(),
-        )?;
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(STATE_FILE), [header, nonce.to_vec(), ct].concat())?;
+        Ok(())
+    }
+
+    #[test]
+    fn version_5_messages_get_local_ids() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut old = sample_state();
+        let entry = old.contacts[0].history[0].clone();
+        old.contacts[0].history.push(entry);
+        write_with_cost(MAGIC_V5, dir.path(), "pw", &v5_state(old))?;
 
         let (profile, state) = Profile::open(dir.path(), "pw")?;
         let bob = &state.contacts[0];

@@ -31,7 +31,10 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::time::Instant;
 
-use crate::{clean, connect, far_future, flush_queued, tick, utc, Network, MAINTENANCE_EVERY};
+use crate::{
+    clean, connect, far_future, flush_held, reconnect, start_decoys, tick, utc, Network,
+    MAINTENANCE_EVERY,
+};
 
 const HELP: &str = "Ctrl-N invite a friend · Ctrl-O enter an invite code · \
                     Ctrl-D disappearing messages · ↑↓ switch chat · Esc quit";
@@ -157,13 +160,8 @@ impl App {
 pub async fn run(mut node: Node) -> Result<()> {
     let slots = node.all_slots();
     let mut mux = connect(&mut node, &slots).await?;
+    let mut scheduler = start_decoys(&mut node);
     node.maintain(&mut mux).await?;
-    let mut scheduler = node.settings().decoy_interval.map(|secs| {
-        Scheduler::new(
-            Duration::from_secs(secs.into()),
-            node.contacts().iter().map(|c| c.name.clone()),
-        )
-    });
 
     let mut terminal = ratatui::init();
     // Start from a blank screen even where the terminal keeps old text.
@@ -179,9 +177,7 @@ pub async fn run(mut node: Node) -> Result<()> {
     ratatui::restore();
     uncopy(&mut app);
 
-    if let Some(s) = scheduler.as_mut() {
-        flush_queued(&mut node, &mut mux, s).await;
-    }
+    flush_held(&mut node, &mut mux).await;
     mux.close().await;
     result
 }
@@ -215,7 +211,17 @@ async fn event_loop(
         let uncopy_at = app.copied.as_ref().map_or_else(far_future, |(_, at)| *at);
         tokio::select! {
             msg = mux.recv() => {
-                let (slot, msg) = msg?;
+                let (slot, msg) = match msg {
+                    Ok(arrived) => arrived,
+                    Err(e) => {
+                        app.status = format!("Connection lost ({e:#}). Reconnecting…");
+                        terminal.draw(|f| draw(f, node, app, scheduler.as_ref(), false))?;
+                        let slots = node.all_slots();
+                        reconnect(node, mux, &slots).await?;
+                        app.status = "Reconnected.".into();
+                        continue;
+                    }
+                };
                 match node.handle_incoming(mux, &slot, &msg.payload).await {
                     Ok(events) => {
                         for event in events {
@@ -389,13 +395,15 @@ async fn submit(
             (_, None) => app.status = "Pick a conversation first.".into(),
         },
         (_, ["/clear"]) => match selected_name(node, app) {
-            Some(name) => app.status = match node.clear_here(&name) {
-                Ok(()) => format!(
+            Some(name) => {
+                app.status = match node.clear_here(&name) {
+                    Ok(()) => format!(
                     "Chat emptied here. {} still has their copy (/clear everyone empties both).",
                     clean(&name)
                 ),
-                Err(e) => format!("✗ {e:#}"),
-            },
+                    Err(e) => format!("✗ {e:#}"),
+                }
+            }
             None => app.status = "Pick a conversation first.".into(),
         },
         (_, ["/clear", "everyone"]) => match selected_name(node, app) {
@@ -421,18 +429,15 @@ async fn submit(
                 app.input = line.to_string();
                 return;
             };
-            match scheduler.as_mut() {
-                Some(s) => {
-                    s.queue(&name, line.to_string());
-                    app.status = "queued; it leaves with the next decoy".into();
+            match node.send_text(mux, &name, line).await {
+                Ok(()) if scheduler.is_some() => {
+                    app.status = "queued; it leaves with the next decoy".into()
                 }
-                None => match node.send_text(mux, &name, line).await {
-                    Ok(()) => app.status = format!("✓ sent to {}", clean(&name)),
-                    Err(e) => {
-                        app.input = line.to_string();
-                        app.status = format!("✗ not sent ({e:#}). Press Enter to try again.");
-                    }
-                },
+                Ok(()) => app.status = format!("✓ sent to {}", clean(&name)),
+                Err(e) => {
+                    app.input = line.to_string();
+                    app.status = format!("✗ not sent ({e:#}). Press Enter to try again.");
+                }
             }
         }
     }
@@ -857,8 +862,8 @@ fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>, aw
     ));
 
     let mut status = clean(&app.status);
-    if let Some(s) = scheduler {
-        status = format!("[decoys on, {} queued] {status}", s.queued());
+    if scheduler.is_some() {
+        status = format!("[decoys on, {} queued] {status}", node.queued());
     }
     let settings = node.settings();
     let tor = if settings.tor { "Tor on" } else { "Tor off" };

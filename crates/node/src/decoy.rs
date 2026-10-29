@@ -1,8 +1,10 @@
 //! Decoy traffic: when enabled, every conversation sends on its own Poisson
-//! clock while privmsg is connected. On each tick the oldest queued message
-//! goes out, or a decoy if nothing is waiting, so the stream of frames
-//! arriving at a contact's gateway is the same whether you are typing or
-//! idle. Real messages wait for the next tick (mean = the interval).
+//! clock while privmsg is connected. On each tick the oldest frame the node
+//! holds for that contact goes out (`Node::tick`), or a decoy if nothing
+//! is waiting, so the stream of frames arriving at a contact's gateway is
+//! the same whether you are typing or idle. Everything waits for the next
+//! tick (mean = the interval): messages, and also deletes, timer changes
+//! and address changes, which would otherwise stand out.
 //!
 //! This hides *when* and *how much* two people talk from anyone counting
 //! packets at the recipient's gateway or correlating both ends over time —
@@ -10,7 +12,7 @@
 //! constant-rate sending, not a differential-privacy mechanism: being online
 //! at all is still visible, and no formal bound is claimed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chacha20poly1305::aead::rand_core::RngCore;
@@ -20,10 +22,10 @@ use tokio::time::Instant;
 /// Shortest interval accepted, so a typo can't flood the mixnet.
 pub const MIN_INTERVAL: u32 = 2;
 
+/// The clocks. What goes out on a tick is the node's business.
 pub struct Scheduler {
     mean: Duration,
     next: HashMap<String, Instant>,
-    outbox: HashMap<String, VecDeque<String>>,
 }
 
 impl Scheduler {
@@ -31,7 +33,6 @@ impl Scheduler {
         let mut scheduler = Self {
             mean,
             next: HashMap::new(),
-            outbox: HashMap::new(),
         };
         for name in contacts {
             scheduler.add(name);
@@ -45,17 +46,6 @@ impl Scheduler {
         self.next.entry(name).or_insert(at);
     }
 
-    pub fn queue(&mut self, name: &str, text: String) {
-        self.outbox
-            .entry(name.to_string())
-            .or_default()
-            .push_back(text);
-    }
-
-    pub fn queued(&self) -> usize {
-        self.outbox.values().map(VecDeque::len).sum()
-    }
-
     /// The conversation whose tick comes first, and when.
     pub fn next_due(&self) -> Option<(String, Instant)> {
         self.next
@@ -64,23 +54,12 @@ impl Scheduler {
             .map(|(name, at)| (name.clone(), *at))
     }
 
-    /// `name`'s tick has come: schedule the next one and return the message
-    /// to send now, if one is waiting (otherwise send a decoy).
-    pub fn tick(&mut self, name: &str) -> Option<String> {
+    /// `name`'s tick has come: schedule the next one.
+    pub fn tick(&mut self, name: &str) {
         let at = Instant::now() + self.interval();
         if let Some(next) = self.next.get_mut(name) {
             *next = at;
         }
-        self.outbox.get_mut(name).and_then(VecDeque::pop_front)
-    }
-
-    /// Everything still queued, for sending before exit.
-    pub fn drain(&mut self) -> Vec<(String, String)> {
-        let mut all = Vec::new();
-        for (name, queue) in self.outbox.iter_mut() {
-            all.extend(queue.drain(..).map(|text| (name.clone(), text)));
-        }
-        all
     }
 
     /// Exponentially distributed, so ticks form a Poisson process.
@@ -96,26 +75,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn real_messages_take_the_place_of_decoys_in_order() {
-        let mut s = Scheduler::new(Duration::from_secs(10), ["bob".to_string()]);
-        assert_eq!(s.tick("bob"), None, "nothing queued: decoy");
-        s.queue("bob", "one".into());
-        s.queue("bob", "two".into());
-        assert_eq!(s.queued(), 2);
-        assert_eq!(s.tick("bob").as_deref(), Some("one"));
-        assert_eq!(s.tick("bob").as_deref(), Some("two"));
-        assert_eq!(s.tick("bob"), None);
-    }
-
-    #[test]
-    fn earliest_conversation_is_due_first_and_drain_empties() {
+    fn earliest_conversation_is_due_first_and_ticks_move_on() {
         let mut s = Scheduler::new(Duration::from_secs(10), ["a".to_string(), "b".to_string()]);
         let (first, at) = s.next_due().unwrap();
         assert!(s.next.values().all(|t| *t >= at));
         s.tick(&first);
-        s.queue("a", "x".into());
-        assert_eq!(s.drain(), vec![("a".to_string(), "x".to_string())]);
-        assert_eq!(s.queued(), 0);
+        assert_ne!(s.next[&first], at, "rescheduled");
     }
 
     #[test]

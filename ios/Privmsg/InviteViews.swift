@@ -32,7 +32,8 @@ struct InviteSheet: View {
                     Section {
                         Text(code)
                             .font(.system(.footnote, design: .monospaced))
-                            .textSelection(.enabled)
+                            // No text selection: the system's Copy would skip the
+                            // private clipboard (Universal Clipboard, no expiry).
                             .lineLimit(4)
                         Button(copied ? "Copied for 3 minutes" : "Copy the code", systemImage: "doc.on.doc") {
                             Clipboard.copyPrivately(code)

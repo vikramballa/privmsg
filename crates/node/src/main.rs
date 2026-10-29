@@ -286,6 +286,31 @@ async fn start(dir: PathBuf) -> Result<()> {
 }
 
 /// A multiplexer over this profile's Nym addresses, with `slots` online.
+/// How long closing dead connections may take before they are dropped.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Attempts to make the connections again after one was lost, and the
+/// wait between them.
+const RECONNECT_TRIES: u32 = 5;
+const RECONNECT_AFTER: Duration = Duration::from_secs(20);
+
+/// After a connection was lost: close every one (keeping Tor) and open the
+/// same addresses again, as the phone app does.
+pub(crate) async fn reconnect(node: &mut Node, mux: &mut Network, slots: &[String]) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        mux.reset(CLOSE_TIMEOUT).await;
+        match node.connect(mux, slots).await {
+            Err(e) if attempt < RECONNECT_TRIES => {
+                tracing::warn!("reconnecting failed ({e:#}); trying again");
+                tokio::time::sleep(RECONNECT_AFTER).await;
+                attempt += 1;
+            }
+            done => return done,
+        }
+    }
+}
+
 pub(crate) async fn connect(node: &mut Node, slots: &[String]) -> Result<Network> {
     let mut net = NymNetwork::new(node.slots_dir(), node.settings().data_mode);
     // Even with nothing to open yet: the app opens addresses later (invites).
@@ -417,13 +442,10 @@ fn contacts(dir: PathBuf) -> Result<()> {
 
 async fn send(dir: PathBuf, name: &str, text: &str) -> Result<()> {
     let mut node = open(&dir)?;
-    let current = node.slots_for(name)?.swap_remove(0);
-    let mut mux = connect(&mut node, &[current]).await?;
-    let result = async {
-        node.maintain(&mut mux).await?;
-        node.send_text(&mut mux, name, text).await
-    }
-    .await;
+    // Only the sender: an address of ours opened here would take in
+    // whatever was waiting for it, and this command would drop it.
+    let mut mux = connect(&mut node, &[]).await?;
+    let result = node.send_text(&mut mux, name, text).await;
     mux.close().await;
     result?;
     println!("sent.");
@@ -497,8 +519,8 @@ fn verify(dir: PathBuf, name: &str) -> Result<()> {
 
 async fn rotate(dir: PathBuf, name: &str) -> Result<()> {
     let mut node = open(&dir)?;
-    let slots = node.slots_for(name)?;
-    let mut mux = connect(&mut node, &slots).await?;
+    // Not the addresses we receive on, for the same reason as `send`.
+    let mut mux = connect(&mut node, &[]).await?;
     let result = node.rotate(&mut mux, name).await;
     mux.close().await;
     result?;
@@ -668,13 +690,8 @@ async fn session(dir: PathBuf, chat_with: Option<&str>, seconds: Option<u64>) ->
         _ => node.all_slots(),
     };
     let mut mux = connect(&mut node, &slots).await?;
+    let mut scheduler = start_decoys(&mut node);
     node.maintain(&mut mux).await?;
-    let mut scheduler = decoy_interval.map(|secs| {
-        Scheduler::new(
-            Duration::from_secs(secs.into()),
-            node.contacts().iter().map(|c| c.name.clone()),
-        )
-    });
     match chat_with {
         Some(_) => eprintln!("connected — type a message and press Enter; /quit to leave"),
         None => eprintln!("listening on {} addresses (Ctrl-C to stop)", slots.len()),
@@ -696,20 +713,22 @@ async fn session(dir: PathBuf, chat_with: Option<&str>, seconds: Option<u64>) ->
                 Ok((slot, msg)) => {
                     receive(&mut node, &mut mux, &slot, &msg.payload, scheduler.as_mut()).await
                 }
-                Err(e) => break Err(e),
+                Err(e) => {
+                    eprintln!("! connection lost ({e:#}); reconnecting…");
+                    if let Err(e) = reconnect(&mut node, &mut mux, &slots).await {
+                        break Err(e);
+                    }
+                    eprintln!("reconnected");
+                }
             },
             line = lines.next_line(), if chat_with.is_some() => match line {
                 Ok(Some(line)) if line.trim() == "/quit" => break Ok(()),
                 Ok(Some(line)) if line.trim().is_empty() => {}
                 Ok(Some(line)) => {
                     let name = chat_with.expect("chat mode");
-                    match scheduler.as_mut() {
-                        Some(s) => s.queue(name, line),
-                        None => {
-                            if let Err(e) = node.send_text(&mut mux, name, &line).await {
-                                eprintln!("! not sent: {e:#}");
-                            }
-                        }
+                    // With decoys on, held for the next tick.
+                    if let Err(e) = node.send_text(&mut mux, name, &line).await {
+                        eprintln!("! not sent: {e:#}");
                     }
                 }
                 Ok(None) => break Ok(()),
@@ -729,35 +748,34 @@ async fn session(dir: PathBuf, chat_with: Option<&str>, seconds: Option<u64>) ->
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }
     };
-    if let Some(s) = scheduler.as_mut() {
-        flush_queued(&mut node, &mut mux, s).await;
-    }
+    flush_held(&mut node, &mut mux).await;
     mux.close().await;
     result
 }
 
-/// One decoy-clock tick for `name`: their oldest queued message, or a decoy.
+/// With decoys on: their clocks, and the node holding every frame for them.
+pub(crate) fn start_decoys(node: &mut Node) -> Option<Scheduler> {
+    let secs = node.settings().decoy_interval?;
+    node.hold_for_decoys();
+    Some(Scheduler::new(
+        Duration::from_secs(secs.into()),
+        node.contacts().iter().map(|c| c.name.clone()),
+    ))
+}
+
+/// One decoy-clock tick for `name`: the oldest frame held for them, or a
+/// decoy.
 pub(crate) async fn tick(node: &mut Node, mux: &mut Network, s: &mut Scheduler, name: &str) {
-    match s.tick(name) {
-        Some(text) => {
-            if let Err(e) = node.send_text(mux, name, &text).await {
-                eprintln!("! not sent to {}: {e:#}", clean(name));
-            }
-        }
-        None => {
-            if let Err(e) = node.send_decoy(mux, name).await {
-                tracing::warn!("decoy to {name} not sent: {e:#}");
-            }
-        }
+    s.tick(name);
+    if let Err(e) = node.tick(mux, name).await {
+        eprintln!("! not sent to {}: {e:#}", clean(name));
     }
 }
 
 /// Send what the decoy clock had not got to yet, so quitting loses nothing.
-pub(crate) async fn flush_queued(node: &mut Node, mux: &mut Network, s: &mut Scheduler) {
-    for (name, text) in s.drain() {
-        if let Err(e) = node.send_text(mux, &name, &text).await {
-            eprintln!("! not sent to {}: {e:#}", clean(&name));
-        }
+pub(crate) async fn flush_held(node: &mut Node, mux: &mut Network) {
+    if let Err(e) = node.send_held(mux).await {
+        eprintln!("! not everything waiting for a decoy was sent: {e:#}");
     }
 }
 

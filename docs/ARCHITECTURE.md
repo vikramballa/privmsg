@@ -80,8 +80,8 @@ The node knows which slot each frame arrived on and enforces:
   belong to the same person.
 
 ### Profile at rest
-`state.enc` = `"PRIVMSG2" | salt | nonce | XChaCha20-Poly1305(state)`, key =
-Argon2id(passphrase, salt), header bound as AAD, atomic replace on every
+`state.enc` = `"PRIVMSG7" | KDF cost | salt | nonce | XChaCha20-Poly1305(state)`,
+key = Argon2id(passphrase, salt), header bound as AAD, atomic replace on every
 save, exclusive file lock while open. State is saved after every change
 because the MLS ratchet advances on every message. `"PRIVMSG1"` profiles are
 upgraded on open: the single Nym client directory `nym/` is renamed to
@@ -89,6 +89,16 @@ upgraded on open: the single Nym client directory `nym/` is renamed to
 and `rotated_at = 0`, so they all move to their own addresses at the next
 connection. The Nym SDK's own files under `slots/` are not covered. On
 macOS the passphrase can be kept in the login keychain (`keychain save`).
+
+Replays across a restart: OpenMLS 0.6 writes its record of used message
+keys to storage when it encrypts, not when it decrypts. After a restart the
+receiving side is back where it was at our last send, and anything that
+arrived since would decrypt again. Each contact therefore keeps the IDs of
+messages received since our last send (`Contact::seen`, at most 1000), and
+a frame with one of them is refused before MLS sees it. The list empties on
+every send, when OpenMLS has saved the used keys itself. The same gap means
+the keys of messages read since our last send stay in `state.enc` until we
+next send.
 
 ### Build notes
 - OpenMLS 0.6 contains `debug_assert!(false)` on AEAD failure, so a debug
@@ -135,12 +145,13 @@ gateway: a burst means someone just wrote to them, and over long periods
 the bursts can be correlated with a sender's activity.
 - **What we do** (`decoy::Scheduler`, opt-in with `privmsg decoys on|<secs>`):
   while connected, every conversation sends on its own Poisson clock (mean
-  interval configurable, default 10 s, minimum 2 s). Each tick carries the
-  oldest queued real message, or an `Envelope::Decoy` padded to the same
-  size. Sphinx encrypts the payload to the recipient, so only the recipient
-  can tell a decoy from a message, and they drop it without touching MLS or
-  the profile. Queued messages are flushed on exit; one-shot `send` is not
-  delayed.
+  interval configurable, default 10 s, minimum 2 s). The node holds every
+  frame for a conversation (messages, deletes, timer and address changes,
+  acks) and each tick carries the oldest, or an `Envelope::Decoy` padded to
+  the same size, so nothing reaches the contact's gateway off the clock.
+  Sphinx encrypts the payload to the recipient, so only the recipient can
+  tell a decoy from a message, and they drop it without touching MLS or the
+  profile. Held frames are flushed on exit; one-shot `send` is not delayed.
 - **Placement:** in the node, beside `send_text`, not in Layer 2. A decoy
   needs the conversation's addresses, and Layers 1 and 2 stay unchanged.
 - **The honest catch:** this is Loopix-style constant-rate sending, *not*

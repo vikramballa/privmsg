@@ -39,7 +39,7 @@
 //! Every state change is saved immediately: the MLS ratchet moves on each
 //! message, and losing that state would make later messages undecryptable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,7 +51,7 @@ use privmsg_transport::{MixAddress, Mux, Network};
 
 use crate::store::{
     Contact, HistoryEntry, OldSlot, PendingInvite, PendingMessage, Profile, Settings, Slot, State,
-    GONE_LIMIT, HISTORY_LIMIT,
+    GONE_LIMIT, HISTORY_LIMIT, SEEN_LIMIT,
 };
 use crate::wire::{
     decode, encode, message_id, valid_address, Envelope, Invite, MessageId, Payload,
@@ -162,6 +162,9 @@ pub struct Node {
     opened: HashMap<String, Instant>,
     /// Conversations whose unconfirmed rotation was re-sent this session.
     rotation_resent: HashSet<Vec<u8>>,
+    /// With decoys on: every frame for a conversation, oldest first, until
+    /// its next decoy tick ([`Node::tick`]). `None`: frames go out at once.
+    held: Option<HashMap<Vec<u8>, VecDeque<Vec<u8>>>>,
 }
 
 impl Node {
@@ -204,6 +207,7 @@ impl Node {
             sessions,
             opened: HashMap::new(),
             rotation_resent: HashSet::new(),
+            held: None,
         }
     }
 
@@ -449,6 +453,59 @@ impl Node {
         self.clear_here(name)
     }
 
+    /// From now on, hold every frame for a contact until [`tick`](Self::tick)
+    /// sends it, so nothing leaves outside the decoy clock: not messages,
+    /// and not deletes, timer or address changes either.
+    pub fn hold_for_decoys(&mut self) {
+        self.held.get_or_insert_with(HashMap::new);
+    }
+
+    /// Frames waiting for their decoy tick.
+    pub fn queued(&self) -> usize {
+        self.held
+            .as_ref()
+            .map_or(0, |held| held.values().map(VecDeque::len).sum())
+    }
+
+    /// `name`'s decoy tick: send the oldest frame held for them, or a decoy.
+    pub async fn tick<N: Network>(&mut self, mux: &mut Mux<N>, name: &str) -> Result<()> {
+        let contact = self.contact(name)?;
+        let (to, group_id) = (
+            MixAddress(contact.address.clone()),
+            contact.group_id.clone(),
+        );
+        let next = self
+            .held
+            .as_mut()
+            .and_then(|held| held.get_mut(&group_id))
+            .and_then(VecDeque::pop_front);
+        match next {
+            Some(frame) => mux.send(&to, &frame).await,
+            None => self.send_decoy(mux, name).await,
+        }
+    }
+
+    /// Send everything held, in order, and stop holding (decoys turned off,
+    /// or quitting). Returns the first failure, after trying every frame.
+    pub async fn send_held<N: Network>(&mut self, mux: &mut Mux<N>) -> Result<()> {
+        let Some(held) = self.held.take() else {
+            return Ok(());
+        };
+        let mut first_error = None;
+        for (group_id, frames) in held {
+            let Some(contact) = self.state.contacts.iter().find(|c| c.group_id == group_id) else {
+                continue;
+            };
+            let to = MixAddress(contact.address.clone());
+            for frame in frames {
+                if let Err(e) = mux.send(&to, &frame).await {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Send a decoy to `name`: on the wire it looks like a short message;
     /// the receiver discards it.
     pub async fn send_decoy<N: Network>(&mut self, mux: &mut Mux<N>, name: &str) -> Result<()> {
@@ -590,6 +647,9 @@ impl Node {
     pub async fn remove<N: Network>(&mut self, mux: &mut Mux<N>, name: &str) -> Result<()> {
         let slots = if let Ok(idx) = self.index(name) {
             let contact = self.state.contacts.remove(idx);
+            if let Some(held) = self.held.as_mut() {
+                held.remove(&contact.group_id);
+            }
             if let Some(session) = self.sessions.remove(&contact.group_id) {
                 session.delete(&self.identity)?;
             }
@@ -754,14 +814,22 @@ impl Node {
         if !on_current && !contact.old_slots.iter().any(|o| o.slot.id == slot) {
             bail!("message arrived on an address that is not this conversation's");
         }
+        let id = message_id(ciphertext);
+        if contact.seen.contains(&id) {
+            bail!("refused a replayed message");
+        }
         let session = self
             .sessions
             .get_mut(group_id)
             .ok_or_else(|| anyhow!("conversation state is missing"))?;
         let plaintext = session.decrypt(&self.identity, ciphertext)?;
+        let contact = &mut self.state.contacts[idx];
+        if contact.seen.len() >= SEEN_LIMIT {
+            contact.seen.remove(0);
+        }
+        contact.seen.push(id);
         let payload = decode::<Payload>(&plaintext)?;
 
-        let contact = &mut self.state.contacts[idx];
         if on_current {
             // They wrote to our newest address, so they have switched.
             let retire_at = unix_now() + RETIRE_GRACE;
@@ -778,7 +846,6 @@ impl Node {
                 bail!("dropped a {}-byte message (limit {MAX_TEXT})", text.len())
             }
             Payload::Text(text) => {
-                let id = message_id(ciphertext);
                 if let Some(pos) = contact.gone.iter().position(|g| *g == id) {
                     // Deleted for both of us while it was on its way.
                     contact.gone.remove(pos);
@@ -839,8 +906,8 @@ impl Node {
     }
 
     /// Encrypt `payload` for the conversation `group_id` and send it to the
-    /// contact; returns the message's ID. Saves either way: the ratchet
-    /// advanced.
+    /// contact (or hold it for the next decoy tick); returns the message's
+    /// ID. Saves either way: the ratchet advanced.
     async fn send_payload<N: Network>(
         &mut self,
         mux: &mut Mux<N>,
@@ -850,7 +917,7 @@ impl Node {
         let contact = self
             .state
             .contacts
-            .iter()
+            .iter_mut()
             .find(|c| c.group_id == group_id)
             .ok_or_else(|| anyhow!("unknown conversation"))?;
         let to = MixAddress(contact.address.clone());
@@ -859,8 +926,17 @@ impl Node {
             .get_mut(group_id)
             .ok_or_else(|| anyhow!("conversation state is missing"))?;
         let ciphertext = session.encrypt(&self.identity, &encode(payload)?)?;
+        // Encrypting saved OpenMLS's record of used keys, received ones
+        // included, so replays of what came before now fail there.
+        contact.seen.clear();
         let id = message_id(&ciphertext);
-        let sent = mux.send(&to, &encode(&Envelope::Mls(ciphertext))?).await;
+        let frame = encode(&Envelope::Mls(ciphertext))?;
+        if let Some(held) = self.held.as_mut() {
+            held.entry(group_id.to_vec()).or_default().push_back(frame);
+            self.save()?;
+            return Ok(id);
+        }
+        let sent = mux.send(&to, &frame).await;
         self.save()?;
         sent.map(|()| id)
     }
@@ -945,6 +1021,7 @@ impl Node {
             disappear_after: None,
             gone: Vec::new(),
             cleared_by_them: None,
+            seen: Vec::new(),
         });
         self.sessions.insert(group_id, session);
     }
@@ -1571,6 +1648,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_replay_is_refused_after_a_restart() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "once").await?;
+        let frame = bob.frame().await?;
+        assert_eq!(bob.deliver(&frame).await?.len(), 1);
+        let mut bob = bob.reopen()?;
+        assert!(bob.deliver(&frame).await.is_err(), "replay refused");
+        assert_eq!(texts(&bob, "alice"), ["once"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replay_is_refused_after_sending_and_restarting() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "once").await?;
+        let frame = bob.frame().await?;
+        bob.deliver(&frame).await?;
+        bob.send("alice", "reply").await?;
+        assert!(
+            bob.node.contact("alice")?.seen.is_empty(),
+            "saved by MLS now"
+        );
+        let mut bob = bob.reopen()?;
+        assert!(bob.deliver(&frame).await.is_err(), "replay refused");
+        alice.recv().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_sender_never_reuses_a_key_after_restarting() -> Result<()> {
+        // Bob keeps running, so a reused key (or nonce) would be refused.
+        let net = MemoryNetwork::default();
+        let (alice, mut bob) = connected(&net).await?;
+        let mut alice = alice;
+        alice.send("bob", "before").await?;
+        bob.recv().await?;
+        let mut alice = alice.reopen()?;
+        alice.send("bob", "after").await?;
+        assert_eq!(bob.recv().await?, message("alice", "after"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_early_message_replayed_after_its_join_is_refused() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let mut alice = Peer::new(&net)?;
+        let mut bob = Peer::new(&net)?;
+        let code = bob.node.create_invite(&mut bob.mux, "alice").await?;
+        alice
+            .node
+            .accept_invite(&mut alice.mux, &code, "bob")
+            .await?;
+        alice.send("bob", "early").await?;
+        let join = bob.frame().await?;
+        let text = bob.frame().await?;
+        bob.deliver(&text).await?;
+        bob.deliver(&join).await?;
+        let mut bob = bob.reopen()?;
+        assert!(bob.deliver(&text).await.is_err(), "replay refused");
+        assert_eq!(texts(&bob, "alice"), ["early"]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn invite_works_after_inviter_restarts() -> Result<()> {
         let net = MemoryNetwork::default();
         let mut alice = Peer::new(&net)?;
@@ -1787,6 +1930,52 @@ mod tests {
             bob.node.contact("alice")?.address,
             alice.current_slot("bob").address
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_decoys_everything_waits_for_a_tick_in_order() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.node.hold_for_decoys();
+        alice.send("bob", "one").await?;
+        let one = id_of(&alice, "bob", "one");
+        alice
+            .node
+            .delete_for_everyone(&mut alice.mux, "bob", one)
+            .await?;
+        alice
+            .node
+            .set_timer(&mut alice.mux, "bob", Some(3600))
+            .await?;
+        assert_eq!(alice.node.queued(), 3, "nothing left yet");
+        let quiet = tokio::time::timeout(Duration::from_millis(100), bob.frame()).await;
+        assert!(quiet.is_err(), "nothing on the network before a tick");
+
+        for _ in 0..3 {
+            alice.node.tick(&mut alice.mux, "bob").await?;
+        }
+        assert_eq!(bob.recv().await?, message("alice", "one"));
+        assert_eq!(
+            bob.recv().await?,
+            vec![Event::Deleted {
+                contact: "alice".into()
+            }]
+        );
+        assert_eq!(bob.recv().await?.len(), 1, "the timer");
+        assert!(texts(&bob, "alice").is_empty());
+
+        // Nothing held: a tick sends a decoy.
+        alice.node.tick(&mut alice.mux, "bob").await?;
+        assert!(bob.recv().await?.is_empty());
+
+        // Turning decoys off sends whatever is still held.
+        alice.send("bob", "two").await?;
+        alice.node.send_held(&mut alice.mux).await?;
+        assert_eq!(alice.node.queued(), 0);
+        assert_eq!(bob.recv().await?, message("alice", "two"));
+        alice.send("bob", "three").await?;
+        assert_eq!(bob.recv().await?, message("alice", "three"), "at once now");
         Ok(())
     }
 
