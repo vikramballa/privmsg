@@ -5,7 +5,7 @@
 //! `state.enc`, sealed with a key derived from the user's passphrase:
 //!
 //! ```text
-//! "PRIVMSG5" | KDF cost (12) | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
+//! "PRIVMSG6" | KDF cost (12) | salt (16) | nonce (24) | XChaCha20-Poly1305(state)
 //! ```
 //!
 //! The key is Argon2id(passphrase, salt) with the cost in the header
@@ -19,7 +19,9 @@
 //! [`LEGACY_SLOT`], and every contact is due for an address rotation.
 //! Version 2 profiles (`"PRIVMSG2"`) only lack the network settings and get
 //! the defaults. Version 3 profiles (`"PRIVMSG3"`) lack disappearing
-//! messages and auto-sleep, which start off. Versions 1–4 used the Argon2
+//! messages and auto-sleep, which start off. Versions 4 and 5
+//! (`"PRIVMSG4"`, `"PRIVMSG5"`) have no message IDs: their messages get
+//! local ones, so they can be deleted here but not for both sides. Versions 1–4 used the Argon2
 //! crate's default cost and no cost field; they are re-keyed at [`KDF`] when
 //! opened.
 //!
@@ -40,7 +42,10 @@ use privmsg_transport::DataMode;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"PRIVMSG5";
+use crate::wire::MessageId;
+
+const MAGIC: &[u8; 8] = b"PRIVMSG6";
+const MAGIC_V5: &[u8; 8] = b"PRIVMSG5";
 const MAGIC_V4: &[u8; 8] = b"PRIVMSG4";
 const MAGIC_V3: &[u8; 8] = b"PRIVMSG3";
 const MAGIC_V2: &[u8; 8] = b"PRIVMSG2";
@@ -76,6 +81,9 @@ const KDF: Kdf = Kdf {
 
 /// Messages kept per contact; older ones are dropped.
 pub const HISTORY_LIMIT: usize = 500;
+
+/// Deletions remembered per contact for messages that have not arrived yet.
+pub const GONE_LIMIT: usize = 64;
 
 /// The slot a version 1 profile's single address was moved to.
 pub const LEGACY_SLOT: &str = "legacy";
@@ -147,6 +155,12 @@ pub struct Contact {
     pub unread: u32,
     /// Messages older than this many seconds are deleted, on both sides.
     pub disappear_after: Option<u64>,
+    /// Messages the contact deleted for both of us before they arrived
+    /// here (the mixnet can reorder): dropped when they do.
+    pub gone: Vec<MessageId>,
+    /// When the contact last emptied the chat for both of us, if they did
+    /// since we last emptied it ourselves (Unix seconds).
+    pub cleared_by_them: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -170,6 +184,91 @@ pub struct HistoryEntry {
     pub text: String,
     /// Unix seconds.
     pub at: u64,
+    pub id: MessageId,
+    /// Whether the contact knows the message by `id` too
+    /// (`wire::message_id`). Messages from before version 6 have a random
+    /// local one, so they can only be deleted on this side.
+    pub shared: bool,
+}
+
+/// The state layout of versions 4 and 5: no message IDs.
+mod v5 {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct State {
+        pub identity: Vec<u8>,
+        pub contacts: Vec<Contact>,
+        pub invites: Vec<super::PendingInvite>,
+        pub pending: Vec<super::PendingMessage>,
+        pub settings: super::Settings,
+    }
+
+    #[derive(Deserialize)]
+    pub struct Contact {
+        pub name: String,
+        pub group_id: Vec<u8>,
+        pub address: String,
+        pub slot: super::Slot,
+        pub old_slots: Vec<super::OldSlot>,
+        pub rotated_at: u64,
+        pub history: Vec<HistoryEntry>,
+        pub unread: u32,
+        pub disappear_after: Option<u64>,
+    }
+
+    #[derive(Deserialize)]
+    pub struct HistoryEntry {
+        pub outgoing: bool,
+        pub text: String,
+        pub at: u64,
+    }
+}
+
+/// Older messages with fresh local IDs.
+fn upgrade_history(history: Vec<v5::HistoryEntry>) -> Vec<HistoryEntry> {
+    history
+        .into_iter()
+        .map(|e| {
+            let mut id = MessageId::default();
+            OsRng.fill_bytes(&mut id);
+            HistoryEntry {
+                outgoing: e.outgoing,
+                text: e.text,
+                at: e.at,
+                id,
+                shared: false,
+            }
+        })
+        .collect()
+}
+
+impl From<v5::State> for State {
+    fn from(old: v5::State) -> Self {
+        State {
+            identity: old.identity,
+            contacts: old
+                .contacts
+                .into_iter()
+                .map(|c| Contact {
+                    name: c.name,
+                    group_id: c.group_id,
+                    address: c.address,
+                    slot: c.slot,
+                    old_slots: c.old_slots,
+                    rotated_at: c.rotated_at,
+                    history: upgrade_history(c.history),
+                    unread: c.unread,
+                    disappear_after: c.disappear_after,
+                    gone: Vec::new(),
+                    cleared_by_them: None,
+                })
+                .collect(),
+            invites: old.invites,
+            pending: old.pending,
+            settings: old.settings,
+        }
+    }
 }
 
 /// An invite we handed out and nobody has used yet.
@@ -212,7 +311,7 @@ mod v3 {
         pub slot: super::Slot,
         pub old_slots: Vec<super::OldSlot>,
         pub rotated_at: u64,
-        pub history: Vec<super::HistoryEntry>,
+        pub history: Vec<super::v5::HistoryEntry>,
         pub unread: u32,
     }
 }
@@ -226,9 +325,11 @@ impl From<v3::Contact> for Contact {
             slot: c.slot,
             old_slots: c.old_slots,
             rotated_at: c.rotated_at,
-            history: c.history,
+            history: upgrade_history(c.history),
             unread: c.unread,
             disappear_after: None,
+            gone: Vec::new(),
+            cleared_by_them: None,
         }
     }
 }
@@ -296,7 +397,7 @@ mod v1 {
         pub name: String,
         pub group_id: Vec<u8>,
         pub address: String,
-        pub history: Vec<super::HistoryEntry>,
+        pub history: Vec<super::v5::HistoryEntry>,
     }
 
     #[derive(Deserialize)]
@@ -325,9 +426,11 @@ impl From<v1::State> for State {
                     old_slots: Vec::new(),
                     // Due at once: move off the shared address.
                     rotated_at: 0,
-                    history: c.history,
+                    history: upgrade_history(c.history),
                     unread: 0,
                     disappear_after: None,
+                    gone: Vec::new(),
+                    cleared_by_them: None,
                 })
                 .collect(),
             invites: old
@@ -411,17 +514,19 @@ impl Profile {
         let lock = lock(dir)?;
         let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let current = data.starts_with(MAGIC);
+        let version_5 = data.starts_with(MAGIC_V5);
         let version_1 = data.starts_with(MAGIC_V1);
         let version_2 = data.starts_with(MAGIC_V2);
         let version_3 = data.starts_with(MAGIC_V3);
         let version_4 = data.starts_with(MAGIC_V4);
-        let header_len = if current { HEADER_LEN } else { OLD_HEADER_LEN };
+        let has_cost = current || version_5;
+        let header_len = if has_cost { HEADER_LEN } else { OLD_HEADER_LEN };
         if data.len() < header_len + NONCE_LEN
-            || !(current || version_4 || version_3 || version_2 || version_1)
+            || !(current || version_5 || version_4 || version_3 || version_2 || version_1)
         {
             bail!("{} is not a privmsg profile", path.display());
         }
-        let (kdf, salt): (Kdf, [u8; SALT_LEN]) = if current {
+        let (kdf, salt): (Kdf, [u8; SALT_LEN]) = if has_cost {
             let kdf = Kdf::decode(&data[MAGIC.len()..MAGIC.len() + KDF_LEN])
                 .with_context(|| format!("{} has a damaged header", path.display()))?;
             (kdf, data[MAGIC.len() + KDF_LEN..HEADER_LEN].try_into()?)
@@ -457,8 +562,13 @@ impl Profile {
             profile.key = derive_key(KDF, passphrase, &profile.salt)?;
             profile.kdf = KDF;
         }
-        if version_2 || version_3 {
-            let state = if version_3 {
+        if version_2 || version_3 || version_4 || version_5 {
+            let state = if version_4 || version_5 {
+                State::from(
+                    bincode::deserialize::<v5::State>(&plaintext)
+                        .context("decode profile state")?,
+                )
+            } else if version_3 {
                 State::from(
                     bincode::deserialize::<v3::State>(&plaintext)
                         .context("decode profile state")?,
@@ -470,7 +580,7 @@ impl Profile {
                 )
             };
             profile.save(&state)?;
-            tracing::info!("upgraded profile to version 5");
+            tracing::info!("upgraded profile to version 6");
             return Ok((profile, state));
         }
         if !version_1 {
@@ -493,7 +603,7 @@ impl Profile {
         }
         let state = State::from(old);
         profile.save(&state)?;
-        tracing::info!("upgraded profile to version 5");
+        tracing::info!("upgraded profile to version 6");
         Ok((profile, state))
     }
 
@@ -672,9 +782,13 @@ mod tests {
                     outgoing: true,
                     text: "hi".into(),
                     at: 1,
+                    id: [8; 16],
+                    shared: true,
                 }],
                 unread: 0,
                 disappear_after: Some(3600),
+                gone: vec![],
+                cleared_by_them: None,
             }],
             invites: vec![],
             pending: vec![],
@@ -682,7 +796,26 @@ mod tests {
         }
     }
 
-    /// The version 3 encoding of a contact: everything but the timer.
+    /// A message as versions 1–5 stored it: no ID.
+    #[derive(Serialize)]
+    struct EntryV5 {
+        outgoing: bool,
+        text: String,
+        at: u64,
+    }
+
+    fn v5_history(history: Vec<HistoryEntry>) -> Vec<EntryV5> {
+        history
+            .into_iter()
+            .map(|e| EntryV5 {
+                outgoing: e.outgoing,
+                text: e.text,
+                at: e.at,
+            })
+            .collect()
+    }
+
+    /// The version 3 encoding of a contact: no timer, no message IDs.
     #[derive(Serialize)]
     struct ContactV3 {
         name: String,
@@ -691,7 +824,7 @@ mod tests {
         slot: Slot,
         old_slots: Vec<OldSlot>,
         rotated_at: u64,
-        history: Vec<HistoryEntry>,
+        history: Vec<EntryV5>,
         unread: u32,
     }
 
@@ -705,10 +838,39 @@ mod tests {
                 slot: c.slot,
                 old_slots: c.old_slots,
                 rotated_at: c.rotated_at,
-                history: c.history,
+                history: v5_history(c.history),
                 unread: c.unread,
             })
             .collect()
+    }
+
+    /// The encoding of versions 4 and 5: the current one without message IDs.
+    fn v5_state(state: State) -> Vec<u8> {
+        let contacts: Vec<_> = state
+            .contacts
+            .into_iter()
+            .map(|c| {
+                (
+                    c.name,
+                    c.group_id,
+                    c.address,
+                    c.slot,
+                    c.old_slots,
+                    c.rotated_at,
+                    v5_history(c.history),
+                    c.unread,
+                    c.disappear_after,
+                )
+            })
+            .collect();
+        bincode::serialize(&(
+            state.identity,
+            contacts,
+            state.invites,
+            state.pending,
+            state.settings,
+        ))
+        .unwrap()
     }
 
     /// Write `state` the way version 1 did.
@@ -742,7 +904,7 @@ mod tests {
         #[derive(Serialize)]
         struct V1 {
             identity: Vec<u8>,
-            contacts: Vec<(String, Vec<u8>, String, Vec<HistoryEntry>)>,
+            contacts: Vec<(String, Vec<u8>, String, Vec<EntryV5>)>,
             invites: Vec<([u8; 16], String)>,
             pending: Vec<Vec<u8>>,
         }
@@ -752,7 +914,7 @@ mod tests {
                 "bob".into(),
                 vec![9],
                 "bob-address".into(),
-                vec![HistoryEntry {
+                vec![EntryV5 {
                     outgoing: false,
                     text: "old".into(),
                     at: 2,
@@ -871,12 +1033,7 @@ mod tests {
     #[test]
     fn version_4_profile_is_rekeyed_at_the_current_cost() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        write_old(
-            MAGIC_V4,
-            dir.path(),
-            "pw",
-            &bincode::serialize(&sample_state())?,
-        )?;
+        write_old(MAGIC_V4, dir.path(), "pw", &v5_state(sample_state()))?;
         let (_, state) = Profile::open(dir.path(), "pw")?;
         assert_eq!(state.contacts[0].history[0].text, "hi");
 
@@ -886,6 +1043,43 @@ mod tests {
         assert_ne!(&raw[MAGIC.len() + KDF_LEN..HEADER_LEN], &[3u8; SALT_LEN]);
         let (_, again) = Profile::open(dir.path(), "pw")?;
         assert_eq!(again.contacts[0].history[0].text, "hi");
+        Ok(())
+    }
+
+    #[test]
+    fn version_5_messages_get_local_ids() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut old = sample_state();
+        let entry = old.contacts[0].history[0].clone();
+        old.contacts[0].history.push(entry);
+        let (salt, kdf) = ([5u8; SALT_LEN], KDF);
+        let key = derive_key(kdf, "pw", &salt)?;
+        let header = [MAGIC_V5.as_slice(), &kdf.encode(), &salt].concat();
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ct = XChaCha20Poly1305::new(key.as_ref().into())
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &v5_state(old),
+                    aad: &header,
+                },
+            )
+            .map_err(|_| anyhow!("encrypt"))?;
+        fs::write(
+            dir.path().join(STATE_FILE),
+            [header, nonce.to_vec(), ct].concat(),
+        )?;
+
+        let (profile, state) = Profile::open(dir.path(), "pw")?;
+        let bob = &state.contacts[0];
+        assert_eq!(bob.disappear_after, Some(3600));
+        assert!(bob.history.iter().all(|e| !e.shared), "only deletable here");
+        assert_ne!(bob.history[0].id, bob.history[1].id);
+        drop(profile);
+        let raw = fs::read(dir.path().join(STATE_FILE))?;
+        assert!(raw.starts_with(MAGIC), "rewritten as the current version");
+        let (_, again) = Profile::open(dir.path(), "pw")?;
+        assert_eq!(again.contacts[0].history[0].id, bob.history[0].id, "kept");
         Ok(())
     }
 

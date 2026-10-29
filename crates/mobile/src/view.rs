@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use privmsg_node::app::{describe_timer, Node};
 use privmsg_node::store::{Contact, Settings};
+use privmsg_node::wire::MessageId;
 
 use crate::{ConnectionStatus, ContactInfo, DataModeChoice, MessageInfo, SettingsInfo};
 
@@ -63,15 +64,31 @@ fn contact(c: &Contact) -> ContactInfo {
         last_at: last.map(|e| e.at),
         disappear_after: c.disappear_after,
         disappear_label: describe_timer(c.disappear_after),
+        cleared_by_them: c.cleared_by_them.is_some(),
     }
 }
 
 fn message(e: &privmsg_node::store::HistoryEntry) -> MessageInfo {
     MessageInfo {
+        id: e.id.iter().map(|b| format!("{b:02x}")).collect(),
         outgoing: e.outgoing,
         text: text(&e.text),
         at: e.at,
+        can_delete_for_everyone: e.outgoing && e.shared,
     }
+}
+
+/// A [`MessageInfo::id`] back as the messenger's.
+pub(crate) fn parse_id(id: &str) -> anyhow::Result<MessageId> {
+    let gone = || anyhow::anyhow!("That message is already gone.");
+    let mut out = MessageId::default();
+    if id.len() != 2 * out.len() || !id.is_ascii() {
+        return Err(gone());
+    }
+    for (byte, i) in out.iter_mut().zip((0..id.len()).step_by(2)) {
+        *byte = u8::from_str_radix(&id[i..i + 2], 16).map_err(|_| gone())?;
+    }
+    Ok(out)
 }
 
 /// Message text made safe to show: like the desktop's cleaning (no control
@@ -107,6 +124,16 @@ impl Default for DataModeChoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_ids_round_trip() {
+        let id: MessageId = std::array::from_fn(|i| i as u8 * 17);
+        let shown: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(parse_id(&shown).unwrap(), id);
+        assert!(parse_id("").is_err());
+        assert!(parse_id(&shown[2..]).is_err());
+        assert!(parse_id(&shown.replace('0', "g")).is_err());
+    }
 
     #[test]
     fn message_text_keeps_lines_but_not_tricks() {

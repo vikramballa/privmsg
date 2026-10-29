@@ -12,6 +12,9 @@ struct ChatView: View {
     @State private var error: String?
     @State private var safetyNumber: String?
     @State private var confirmingRemove = false
+    @State private var confirmingClear = false
+    /// The message whose "Delete…" was picked, while asking how.
+    @State private var deleting: MessageInfo?
 
     private var contact: ContactInfo? {
         model.contacts.first { $0.name == name }
@@ -28,16 +31,26 @@ struct ChatView: View {
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 8)
                         }
-                        ForEach(Array(messages.enumerated()), id: \.offset) { index, message in
-                            Bubble(message: message).id(index)
+                        if let contact, contact.clearedByThem {
+                            Label("\(contact.displayName) cleared the chat", systemImage: "trash")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 8)
+                        }
+                        ForEach(messages, id: \.id) { message in
+                            Bubble(message: message) { deleting = message }
+                                .id(message.id)
                         }
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                 }
                 .defaultScrollAnchor(.bottom)
-                .onChange(of: messages.count) { _, count in
-                    withAnimation { scroller.scrollTo(count - 1, anchor: .bottom) }
+                .onChange(of: messages.count) { old, new in
+                    // Down to a new message, but not on a delete.
+                    if new > old, let last = messages.last {
+                        withAnimation { scroller.scrollTo(last.id, anchor: .bottom) }
+                    }
                 }
             }
             if let error {
@@ -82,6 +95,39 @@ struct ChatView: View {
             }
         } message: {
             Text("They are not told. To talk again, one of you sends a new invite.")
+        }
+        .confirmationDialog(
+            "Delete this message?",
+            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+            titleVisibility: .visible,
+            presenting: deleting
+        ) { message in
+            Button("Delete for me", role: .destructive) {
+                Task { await delete(message, everyone: false) }
+            }
+            if message.canDeleteForEveryone {
+                Button("Delete for everyone", role: .destructive) {
+                    Task { await delete(message, everyone: true) }
+                }
+            }
+        } message: { message in
+            if message.canDeleteForEveryone {
+                Text("\u{201C}For everyone\u{201D} also deletes it from \(contact?.displayName ?? name)'s phone. If they already read it, that can't be undone.")
+            }
+        }
+        .confirmationDialog(
+            "Delete all messages with \(contact?.displayName ?? name)?",
+            isPresented: $confirmingClear,
+            titleVisibility: .visible
+        ) {
+            Button("Delete for me", role: .destructive) {
+                Task { await clear(everyone: false) }
+            }
+            Button("Delete for everyone", role: .destructive) {
+                Task { await clear(everyone: true) }
+            }
+        } message: {
+            Text("\(contact?.displayName ?? name) stays in your chats. \u{201C}For everyone\u{201D} also empties their copy; they see that you cleared it.")
         }
     }
 
@@ -142,7 +188,10 @@ struct ChatView: View {
                     }
                 }
             }
-            Button("Remove contact", systemImage: "trash", role: .destructive) {
+            Button("Delete chat", systemImage: "trash", role: .destructive) {
+                confirmingClear = true
+            }
+            Button("Remove contact", systemImage: "person.crop.circle.badge.minus", role: .destructive) {
                 confirmingRemove = true
             }
         } label: {
@@ -171,6 +220,24 @@ struct ChatView: View {
         }
     }
 
+    private func delete(_ message: MessageInfo, everyone: Bool) async {
+        do {
+            try await model.deleteMessage(message.id, with: name, everyone: everyone)
+            error = nil
+        } catch {
+            self.error = "Not deleted: \(describe(error))"
+        }
+    }
+
+    private func clear(everyone: Bool) async {
+        do {
+            try await model.clearChat(with: name, everyone: everyone)
+            error = nil
+        } catch {
+            self.error = "Not deleted: \(describe(error))"
+        }
+    }
+
     private func setTimer(_ seconds: UInt64?) async {
         do {
             try await model.setTimer(seconds, for: name)
@@ -183,6 +250,8 @@ struct ChatView: View {
 
 private struct Bubble: View {
     let message: MessageInfo
+    /// "Delete…" was picked from the long-press menu.
+    let onDelete: () -> Void
 
     var body: some View {
         HStack {
@@ -196,7 +265,12 @@ private struct Bubble: View {
                         RoundedRectangle(cornerRadius: 18)
                             .fill(message.outgoing ? Color.blue : Color(.secondarySystemBackground))
                     )
-                    .textSelection(.enabled)
+                    .contextMenu {
+                        Button("Copy", systemImage: "doc.on.doc") {
+                            Clipboard.copyPrivately(message.text)
+                        }
+                        Button("Delete…", systemImage: "trash", role: .destructive, action: onDelete)
+                    }
                 Text(shortTime(message.at))
                     .font(.caption2)
                     .foregroundStyle(.secondary)

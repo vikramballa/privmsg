@@ -168,6 +168,14 @@ final class AppModel {
         try await messenger?.rotate(name: name)
     }
 
+    func deleteMessage(_ id: String, with name: String, everyone: Bool) async throws {
+        try await messenger?.deleteMessage(name: name, id: id, everyone: everyone)
+    }
+
+    func clearChat(with name: String, everyone: Bool) async throws {
+        try await messenger?.clearChat(name: name, everyone: everyone)
+    }
+
     func remove(_ name: String) async throws {
         try await messenger?.remove(name: name)
     }

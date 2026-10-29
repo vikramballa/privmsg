@@ -146,6 +146,86 @@ async fn two_phones_connect_and_talk() {
 }
 
 #[tokio::test]
+async fn messages_and_chats_are_deleted_here_or_for_both() {
+    let net = MemoryNetwork::default();
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (alice, _) = start(a_dir.path(), &net, true);
+    let (bob, bob_hears) = start(b_dir.path(), &net, true);
+    until("online", || {
+        alice.status() == ConnectionStatus::Online && bob.status() == ConnectionStatus::Online
+    })
+    .await;
+    let code = bob.create_invite("alice".into()).await.unwrap();
+    alice.accept_invite(code, "bob".into()).await.unwrap();
+    until("the join", || bob.contacts().len() == 1).await;
+
+    for text in ["one", "oops", "three"] {
+        alice.send("bob".into(), text.into()).await.unwrap();
+    }
+    until("the messages", || bob.messages("alice".into()).len() == 3).await;
+    let theirs = &bob.messages("alice".into())[0];
+    assert!(
+        !theirs.can_delete_for_everyone,
+        "not Bob's to delete for Alice"
+    );
+    let err = bob
+        .delete_message("alice".into(), theirs.id.clone(), true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("own"), "{err}");
+
+    // For everyone: gone on both phones.
+    let oops = alice.messages("bob".into())[1].clone();
+    assert!(oops.can_delete_for_everyone);
+    alice
+        .delete_message("bob".into(), oops.id, true)
+        .await
+        .unwrap();
+    until("the delete", || bob.messages("alice".into()).len() == 2).await;
+    let left: Vec<String> = bob
+        .messages("alice".into())
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(left, ["one", "three"]);
+
+    // Here only: Alice keeps hers.
+    let one = bob.messages("alice".into())[0].id.clone();
+    bob.delete_message("alice".into(), one, false)
+        .await
+        .unwrap();
+    assert_eq!(bob.messages("alice".into()).len(), 1);
+    assert_eq!(alice.messages("bob".into()).len(), 2);
+    let err = bob
+        .delete_message("alice".into(), "not an id".into(), false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("gone"), "{err}");
+
+    // The whole chat, for both: Bob is told who emptied it.
+    alice.clear_chat("bob".into(), true).await.unwrap();
+    assert!(alice.messages("bob".into()).is_empty());
+    until("the clear", || bob.contacts()[0].cleared_by_them).await;
+    assert!(bob.messages("alice".into()).is_empty());
+    assert!(bob_hears
+        .notices
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|n| n.contains("alice cleared the chat")));
+
+    // Here only, which also works offline.
+    bob.send("alice".into(), "new start".into()).await.unwrap();
+    until("the message", || alice.messages("bob".into()).len() == 1).await;
+    bob.clear_chat("alice".into(), false).await.unwrap();
+    assert!(bob.messages("alice".into()).is_empty());
+    assert!(!bob.contacts()[0].cleared_by_them);
+    assert_eq!(alice.messages("bob".into()).len(), 1);
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+#[tokio::test]
 async fn decoys_queue_messages_and_settings_stick() {
     let net = MemoryNetwork::default();
     let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());

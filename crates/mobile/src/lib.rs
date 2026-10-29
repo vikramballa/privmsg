@@ -84,15 +84,21 @@ pub struct ContactInfo {
     pub disappear_after: Option<u64>,
     /// The same in words ("off", "1 hour").
     pub disappear_label: String,
+    /// They emptied the chat for both of you since you last emptied it.
+    pub cleared_by_them: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct MessageInfo {
+    /// What to pass back to delete it.
+    pub id: String,
     pub outgoing: bool,
     /// Safe to show (see `view::text`).
     pub text: String,
     /// Unix seconds.
     pub at: u64,
+    /// Ours, and new enough that the contact knows it by `id` too.
+    pub can_delete_for_everyone: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -288,6 +294,35 @@ impl Messenger {
     pub async fn set_timer(&self, name: String, after: Option<u64>) -> Result<(), MobileError> {
         self.ask(|reply| Command::SetTimer { name, after, reply })
             .await
+    }
+
+    /// Delete the message `id` from the chat with `name`: here only, or
+    /// (for a message we sent) on both sides.
+    pub async fn delete_message(
+        &self,
+        name: String,
+        id: String,
+        everyone: bool,
+    ) -> Result<(), MobileError> {
+        let id = view::parse_id(&id)?;
+        self.ask(|reply| Command::Delete {
+            name,
+            id,
+            everyone,
+            reply,
+        })
+        .await
+    }
+
+    /// Empty the chat with `name` (the contact stays): here only, or on
+    /// both sides.
+    pub async fn clear_chat(&self, name: String, everyone: bool) -> Result<(), MobileError> {
+        self.ask(|reply| Command::Clear {
+            name,
+            everyone,
+            reply,
+        })
+        .await
     }
 
     /// Forget a contact (or an unused invite) and destroy its addresses.

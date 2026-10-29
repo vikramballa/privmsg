@@ -46,8 +46,11 @@ makes `ios/build/privmsg.ipa` for them to sign and install.
 - **+ → Invite a friend** makes a one-time code. When you're together, they
   scan the QR code; otherwise send them the code.
 - **+ → I have an invite code**: paste or scan a code you got.
+- Press and hold a message to copy or delete it: **Delete for me**, or for
+  your own messages **Delete for everyone**.
 - In a chat, **⋯** has disappearing messages, the safety number (compare
-  it with your friend in person), a new address, and removing the contact.
+  it with your friend in person), a new address, **Delete chat** (for you
+  or for everyone; the contact stays), and removing the contact.
 
 ## What's different from the desktop
 
@@ -67,8 +70,8 @@ makes `ios/build/privmsg.ipa` for them to sign and install.
 - Only Apple's keyboard works in the app (other keyboards could send what
   you type anywhere), and autocorrect is off, so the keyboard doesn't learn
   your messages.
-- Copied invite codes stay on this phone only (no Universal Clipboard) and
-  vanish after 3 minutes.
+- Copied invite codes and messages stay on this phone only (no Universal
+  Clipboard) and vanish after 3 minutes.
 - Apple knows that your Apple ID installed an app with a random name
   (`scripts/build-ios.sh` picks one for your copy). Your mobile carrier sees
   that the phone uses Tor, not what for.

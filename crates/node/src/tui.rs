@@ -8,6 +8,8 @@
 //! to call its sender. (`/invite <name>` and `/add <name> <code>` still work.)
 //! Ctrl-D steps the selected conversation's disappearing-message timer
 //! through off, 5 minutes, 1 hour, 1 day and 1 week (or `/disappear 1h`).
+//! `/clear` empties the selected chat here, `/clear everyone` on both
+//! sides; `/unsend` deletes your last message in it on both sides.
 //!
 //! With auto-sleep on, the sender (and its cover traffic) stops after the
 //! set minutes without typing and comes back on the next key press.
@@ -234,7 +236,10 @@ async fn event_loop(
                                 Event::Timer { contact, after } => {
                                     app.status = timer_status(Some(&contact), &contact, after);
                                 }
-                                Event::Message { .. } => {}
+                                // The chat shows it (a deleted message leaves no trace).
+                                Event::Message { .. }
+                                | Event::Deleted { .. }
+                                | Event::Cleared { .. } => {}
                             }
                         }
                     }
@@ -383,6 +388,29 @@ async fn submit(
             (Err(e), _) => app.status = format!("{e:#}"),
             (_, None) => app.status = "Pick a conversation first.".into(),
         },
+        (_, ["/clear"]) => match selected_name(node, app) {
+            Some(name) => app.status = match node.clear_here(&name) {
+                Ok(()) => format!(
+                    "Chat emptied here. {} still has their copy (/clear everyone empties both).",
+                    clean(&name)
+                ),
+                Err(e) => format!("✗ {e:#}"),
+            },
+            None => app.status = "Pick a conversation first.".into(),
+        },
+        (_, ["/clear", "everyone"]) => match selected_name(node, app) {
+            Some(name) => {
+                app.status = match node.clear_for_everyone(mux, &name).await {
+                    Ok(()) => format!("Chat emptied, here and for {}.", clean(&name)),
+                    Err(e) => format!("✗ not cleared: {e:#}"),
+                }
+            }
+            None => app.status = "Pick a conversation first.".into(),
+        },
+        (_, ["/unsend"]) => match selected_name(node, app) {
+            Some(name) => app.status = unsend(node, mux, &name).await,
+            None => app.status = "Pick a conversation first.".into(),
+        },
         (_, [cmd, ..]) if cmd.starts_with('/') => app.status = HELP.into(),
         (_, []) => {}
         _ => {
@@ -407,6 +435,22 @@ async fn submit(
                 },
             }
         }
+    }
+}
+
+/// `/unsend`: delete our last message to `name` on both sides.
+async fn unsend(node: &mut Node, mux: &mut Network, name: &str) -> String {
+    let id = match node.last_sent(name) {
+        Ok(Some(id)) => id,
+        Ok(None) => return "You have no messages here to unsend.".into(),
+        Err(e) => return format!("✗ {e:#}"),
+    };
+    match node.delete_for_everyone(mux, name, id).await {
+        Ok(()) => format!(
+            "Your last message is deleted, here and for {}.",
+            clean(name)
+        ),
+        Err(e) => format!("✗ not deleted: {e:#}"),
     }
 }
 
@@ -760,13 +804,19 @@ fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>, aw
         Paragraph::new(notice.as_str())
     } else if let Some(contact) = selected {
         let inner = block.inner(chat_area);
-        let lines: Vec<String> = contact
-            .history
-            .iter()
-            .map(|e| {
+        let cleared = contact.cleared_by_them.map(|at| {
+            format!(
+                "{} — {} cleared the chat —",
+                &utc(at)[11..],
+                clean(&contact.name)
+            )
+        });
+        let lines: Vec<String> = cleared
+            .into_iter()
+            .chain(contact.history.iter().map(|e| {
                 let who = if e.outgoing { "me" } else { &contact.name };
                 format!("{} {}: {}", &utc(e.at)[11..], clean(who), clean(&e.text))
-            })
+            }))
             .collect();
         if lines.is_empty() {
             Paragraph::new(format!(

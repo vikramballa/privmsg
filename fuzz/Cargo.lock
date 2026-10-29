@@ -1163,6 +1163,7 @@ dependencies = [
  "rpassword",
  "security-framework",
  "serde",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",

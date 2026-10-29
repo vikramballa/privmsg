@@ -5,7 +5,9 @@ import XCTest
 /// made an invite: run with TEST_RUNNER_INVITE_CODE=<code> (and
 /// TEST_RUNNER_PRIVMSG_TOR=<path to a tor program>, since a simulator build
 /// without the linked-in Tor starts tor as a program), then send
-/// "hi phone" from the desktop once it has the phone's message.
+/// "hi phone" from the desktop once it has the phone's message. The phone
+/// then sends "delete me" and deletes it for everyone; once the desktop has
+/// seen that, run `privmsg clear <name> everyone` there.
 final class LiveTests: XCTestCase {
     private let passphrase = "simulator test passphrase"
 
@@ -88,5 +90,30 @@ final class LiveTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["hi phone"].waitForExistence(timeout: 900),
                       "the desktop's reply arrives")
         screenshot("reply")
+
+        message.tap()
+        message.typeText("delete me")
+        app.buttons["Send"].tap()
+        let doomed = app.staticTexts["delete me"]
+        XCTAssertTrue(doomed.waitForExistence(timeout: 60))
+        doomed.press(forDuration: 1.2)
+        app.buttons["Delete…"].tap()
+        let everyone = app.buttons["Delete for everyone"]
+        XCTAssertTrue(everyone.waitForExistence(timeout: 5))
+        screenshot("delete-choices")
+        everyone.tap()
+        XCTAssertTrue(gone(doomed, within: 60), "deleted here")
+        screenshot("deleted")
+
+        let cleared = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", "desk cleared the chat")).firstMatch
+        XCTAssertTrue(cleared.waitForExistence(timeout: 900), "the desktop empties the chat")
+        XCTAssertFalse(app.staticTexts["hi phone"].exists, "for both sides")
+        screenshot("cleared")
+    }
+
+    private func gone(_ element: XCUIElement, within seconds: TimeInterval) -> Bool {
+        let gone = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: element)
+        return XCTWaiter.wait(for: [gone], timeout: seconds) == .completed
     }
 }

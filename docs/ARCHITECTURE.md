@@ -51,12 +51,24 @@ MLS plaintext   = Payload::Hello { reply_to, invite_tag }
                 | Payload::Text(String)                      ≤ 16 KiB
                 | Payload::Rotate { reply_to }               "write to me here now"
                 | Payload::RotateAck                         sent to the new address
+                | Payload::Timer { after }                   disappearing messages
+                | Payload::Delete { id }                     "delete my message, for you too"
+                | Payload::Clear { yours, mine }             "I emptied our chat for both"
+message id      = SHA-256("privmsg message id\0" ‖ mls_ciphertext)[..16]
 invite code     = "privmsg1:" base64url({ mix_address, key_package, tag })
 ```
 Welcome and Hello travel in one frame because the mixnet reorders. Later
 messages that still overtake the Join are buffered (bounded, and only on an
 open invite's slot) until it arrives. All decoding of network input is
 size-limited and rejects trailing bytes.
+
+Both sides know each message by the same ID without sending one: the
+sender hashes the ciphertext it made, the receiver the one it got. A
+`Delete` removes only a message its sender sent. A `Clear` removes all of
+the clearer's messages, and the receiver's up to `yours` (the newest the
+clearer had), so a message crossing the `Clear` survives on both sides. A
+`Delete` or `Clear` that overtakes its message leaves the ID in a short
+list (`Contact::gone`, 64 at most), and the message is dropped on arrival.
 
 ### Arrival checks
 The node knows which slot each frame arrived on and enforces:

@@ -53,6 +53,8 @@ commands:
   listen [seconds]        receive messages until Ctrl-C (or for <seconds>)
   contacts                list contacts, unread counts and open invites
   history <name>          show saved messages with <name>
+  clear <name> [everyone] delete every message with <name>, here or on both sides
+  unsend <name>           delete your last message to <name>, on both sides
   disappear <name> [off|5m|1h|1d|1w]
                           show or set disappearing messages with <name> (both sides)
   verify <name>           show the safety number to compare with <name>
@@ -131,6 +133,9 @@ async fn main() -> Result<()> {
         ["chat", name] => session(data_dir, Some(name), None).await,
         [] | ["ui"] => start(data_dir).await,
         ["history", name] => history(data_dir, name),
+        ["clear", name] => clear(data_dir, name, false).await,
+        ["clear", name, "everyone"] => clear(data_dir, name, true).await,
+        ["unsend", name] => unsend(data_dir, name).await,
         ["disappear", name] => disappear(data_dir, name, None).await,
         ["disappear", name, after] => disappear(data_dir, name, Some(after)).await,
         ["verify", name] => verify(data_dir, name),
@@ -422,6 +427,35 @@ async fn send(dir: PathBuf, name: &str, text: &str) -> Result<()> {
     mux.close().await;
     result?;
     println!("sent.");
+    Ok(())
+}
+
+async fn clear(dir: PathBuf, name: &str, everyone: bool) -> Result<()> {
+    let mut node = open(&dir)?;
+    if everyone {
+        // Only the sender is needed; nothing has to be received.
+        let mut mux = connect(&mut node, &[]).await?;
+        let result = node.clear_for_everyone(&mut mux, name).await;
+        mux.close().await;
+        result?;
+        println!("chat with {name} emptied, here and in {name}'s app.");
+    } else {
+        node.clear_here(name)?;
+        println!("chat with {name} emptied here. {name} still has their copy.");
+    }
+    Ok(())
+}
+
+async fn unsend(dir: PathBuf, name: &str) -> Result<()> {
+    let mut node = open(&dir)?;
+    let Some(id) = node.last_sent(name)? else {
+        bail!("you have no messages to {name} left");
+    };
+    let mut mux = connect(&mut node, &[]).await?;
+    let result = node.delete_for_everyone(&mut mux, name, id).await;
+    mux.close().await;
+    result?;
+    println!("your last message to {name} is deleted, here and in {name}'s app.");
     Ok(())
 }
 
@@ -734,7 +768,9 @@ pub(crate) fn far_future() -> Instant {
 fn history(dir: PathBuf, name: &str) -> Result<()> {
     let mut node = open(&dir)?;
     let contact = node.contact(name)?;
-    if contact.history.is_empty() {
+    if contact.cleared_by_them.is_some() {
+        println!("* {} cleared the chat", clean(name));
+    } else if contact.history.is_empty() {
         println!("no messages with {name} yet");
     }
     for entry in &contact.history {
@@ -772,6 +808,13 @@ async fn receive(
                         clean(&contact),
                         describe_timer(after)
                     ),
+                    // What was printed stays on screen, so say it is gone.
+                    Event::Deleted { contact } => {
+                        println!("* {} deleted a message, on both sides", clean(&contact))
+                    }
+                    Event::Cleared { contact } => {
+                        println!("* {} cleared the chat, on both sides", clean(&contact))
+                    }
                 }
             }
         }

@@ -24,7 +24,7 @@ enum Storage {
 }
 
 enum Clipboard {
-    /// How long a copied invite code stays on the clipboard.
+    /// How long a copied invite code or message stays on the clipboard.
     static let lifetime: TimeInterval = 180
 
     /// Copy `text` for this phone only (not to other Apple devices through

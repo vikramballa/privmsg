@@ -5,6 +5,7 @@
 //!   └─ Envelope::Join { welcome, hello }   first contact
 //!      Envelope::Mls(ciphertext)           everything after
 //!         └─ MLS-encrypted Payload::Hello / Text / Rotate / RotateAck / Timer
+//!                                  / Delete / Clear
 //!      Envelope::Decoy(random)             cover, discarded on arrival
 //! ```
 //!
@@ -18,6 +19,7 @@ use base64::Engine;
 use bincode::Options;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const INVITE_PREFIX: &str = "privmsg1:";
 
@@ -107,6 +109,32 @@ pub enum Payload {
     Timer {
         after: Option<u64>,
     },
+    /// "Delete this message I sent, for you too." Removes only a message
+    /// from the sender of the `Delete`.
+    Delete {
+        id: MessageId,
+    },
+    /// "I emptied our chat, for both of us." `yours`: the newest message
+    /// the sender had from the receiver, so the receiver's messages still
+    /// on their way survive on both sides; `mine`: the newest one the
+    /// sender sent, in case the `Clear` overtakes it.
+    Clear {
+        yours: Option<MessageId>,
+        mine: Option<MessageId>,
+    },
+}
+
+/// Both sides' name for one message, without sending one: each side hashes
+/// the same MLS ciphertext, the sender after encrypting, the receiver
+/// before decrypting.
+pub type MessageId = [u8; 16];
+
+pub fn message_id(ciphertext: &[u8]) -> MessageId {
+    let digest = Sha256::new()
+        .chain_update(b"privmsg message id\0")
+        .chain_update(ciphertext)
+        .finalize();
+    digest[..16].try_into().expect("16 of 32 bytes")
 }
 
 /// Plausibility check for a mix address received from a peer. The transport

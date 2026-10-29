@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, Result};
 use privmsg_node::app::{Event, Node, MAX_TEXT};
 use privmsg_node::decoy::Scheduler;
 use privmsg_node::store::Settings;
+use privmsg_node::wire::MessageId;
 use privmsg_transport::{Mux, Network};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
@@ -62,6 +63,17 @@ pub(crate) enum Command {
         after: Option<u64>,
         reply: Reply<()>,
     },
+    Delete {
+        name: String,
+        id: MessageId,
+        everyone: bool,
+        reply: Reply<()>,
+    },
+    Clear {
+        name: String,
+        everyone: bool,
+        reply: Reply<()>,
+    },
     Remove(String, Reply<()>),
     Rotate(String, Reply<()>),
     SafetyNumber(String, Reply<String>),
@@ -83,6 +95,14 @@ impl Command {
         matches!(
             self,
             Command::SafetyNumber(..)
+                | Command::Delete {
+                    everyone: false,
+                    ..
+                }
+                | Command::Clear {
+                    everyone: false,
+                    ..
+                }
                 | Command::MarkRead(_)
                 | Command::SetSettings(..)
                 | Command::CheckPassphrase(..)
@@ -101,6 +121,8 @@ impl Command {
             Command::Accept { reply, .. }
             | Command::Send { reply, .. }
             | Command::SetTimer { reply, .. }
+            | Command::Delete { reply, .. }
+            | Command::Clear { reply, .. }
             | Command::Remove(_, reply)
             | Command::Rotate(_, reply) => drop(reply.send(error(why))),
             other => debug_assert!(other.is_local(), "refused a local command"),
@@ -400,6 +422,17 @@ async fn command<N: Network>(
         Command::SetTimer { name, after, reply } => {
             drop(reply.send(node.set_timer(mux, &name, after).await));
         }
+        Command::Delete {
+            name,
+            id,
+            everyone: true,
+            reply,
+        } => drop(reply.send(node.delete_for_everyone(mux, &name, id).await)),
+        Command::Clear {
+            name,
+            everyone: true,
+            reply,
+        } => drop(reply.send(node.clear_for_everyone(mux, &name).await)),
         Command::Remove(name, reply) => drop(reply.send(node.remove(mux, &name).await)),
         Command::Rotate(name, reply) => drop(reply.send(node.rotate(mux, &name).await)),
         Command::SetSettings(settings, reply) => {
@@ -444,6 +477,17 @@ fn local(
     };
     match cmd {
         Command::SafetyNumber(name, reply) => drop(reply.send(node.safety_number(&name))),
+        Command::Delete {
+            name,
+            id,
+            everyone: false,
+            reply,
+        } => drop(reply.send(node.delete_here(&name, id))),
+        Command::Clear {
+            name,
+            everyone: false,
+            reply,
+        } => drop(reply.send(node.clear_here(&name))),
         Command::MarkRead(name) => {
             if let Err(e) = node.mark_read(&name) {
                 tracing::debug!("mark read: {e:#}");
@@ -519,8 +563,11 @@ fn announce(shared: &Shared, scheduler: &mut Option<Scheduler>, event: Event) {
                 privmsg_node::app::describe_timer(after)
             ),
         }),
-        // The view shows it.
-        Event::Message { .. } => {}
+        Event::Cleared { contact } => {
+            shared.notice(format!("{} cleared the chat.", clean(&contact)))
+        }
+        // The view shows it; a deleted message leaves no trace.
+        Event::Message { .. } | Event::Deleted { .. } => {}
     }
 }
 

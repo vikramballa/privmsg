@@ -30,6 +30,12 @@
 //! A message is accepted only on a slot that belongs to its conversation,
 //! so nobody can probe whether two addresses lead to the same person.
 //!
+//! Deleting for both sides: each message is known on both sides by the
+//! hash of its MLS ciphertext (`wire::message_id`), so a `Delete` or
+//! `Clear` can name messages without anything extra on every message. The
+//! mixnet can deliver a `Delete` before the message it names; the ID is
+//! then remembered (`Contact::gone`) and the message dropped on arrival.
+//!
 //! Every state change is saved immediately: the MLS ratchet moves on each
 //! message, and losing that state would make later messages undecryptable.
 
@@ -45,9 +51,11 @@ use privmsg_transport::{MixAddress, Mux, Network};
 
 use crate::store::{
     Contact, HistoryEntry, OldSlot, PendingInvite, PendingMessage, Profile, Settings, Slot, State,
-    HISTORY_LIMIT,
+    GONE_LIMIT, HISTORY_LIMIT,
 };
-use crate::wire::{decode, encode, valid_address, Envelope, Invite, Payload};
+use crate::wire::{
+    decode, encode, message_id, valid_address, Envelope, Invite, MessageId, Payload,
+};
 
 /// Longest message text, in bytes, sent or accepted. It keeps every message
 /// to a few padded blocks and bounds what one contact can add to the profile.
@@ -134,6 +142,14 @@ pub enum Event {
     Timer {
         contact: String,
         after: Option<u64>,
+    },
+    /// The contact deleted one of their messages for both of us.
+    Deleted {
+        contact: String,
+    },
+    /// The contact emptied the chat for both of us.
+    Cleared {
+        contact: String,
     },
 }
 
@@ -347,10 +363,90 @@ impl Node {
             );
         }
         let group_id = self.contact(name)?.group_id.clone();
-        self.send_payload(mux, &group_id, &Payload::Text(text.into()))
+        let id = self
+            .send_payload(mux, &group_id, &Payload::Text(text.into()))
             .await?;
-        self.record(&group_id, true, text);
+        self.record(&group_id, true, text, id);
         self.save()
+    }
+
+    /// The newest message we sent to `name`, if any is left.
+    pub fn last_sent(&self, name: &str) -> Result<Option<MessageId>> {
+        let history = &self.contact(name)?.history;
+        Ok(history.iter().rev().find(|e| e.outgoing).map(|e| e.id))
+    }
+
+    /// Delete one message from our copy of the chat with `name`.
+    pub fn delete_here(&mut self, name: &str, id: MessageId) -> Result<()> {
+        let idx = self.index(name)?;
+        if delete_where(&mut self.state.contacts[idx], |_, e| e.id == id) == 0 {
+            bail!("that message is already gone");
+        }
+        self.save()
+    }
+
+    /// Delete a message we sent to `name`, here and (by telling them) on
+    /// their side.
+    pub async fn delete_for_everyone<N: Network>(
+        &mut self,
+        mux: &mut Mux<N>,
+        name: &str,
+        id: MessageId,
+    ) -> Result<()> {
+        let idx = self.index(name)?;
+        let contact = &self.state.contacts[idx];
+        let entry = contact
+            .history
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow!("that message is already gone"))?;
+        if !entry.outgoing {
+            bail!("only your own messages can be deleted for everyone");
+        }
+        if !entry.shared {
+            bail!(
+                "this message is older than deleting for everyone; delete it for yourself instead"
+            );
+        }
+        let group_id = contact.group_id.clone();
+        self.send_payload(mux, &group_id, &Payload::Delete { id })
+            .await?;
+        delete_where(&mut self.state.contacts[idx], |_, e| e.id == id);
+        self.save()
+    }
+
+    /// Empty our copy of the chat with `name`. The contact stays.
+    pub fn clear_here(&mut self, name: &str) -> Result<()> {
+        let idx = self.index(name)?;
+        let contact = &mut self.state.contacts[idx];
+        contact.history.clear();
+        contact.unread = 0;
+        contact.cleared_by_them = None;
+        self.save()
+    }
+
+    /// Empty the chat with `name` here and (by telling them) on their side.
+    pub async fn clear_for_everyone<N: Network>(
+        &mut self,
+        mux: &mut Mux<N>,
+        name: &str,
+    ) -> Result<()> {
+        let contact = self.contact(name)?;
+        let newest = |outgoing: bool| {
+            contact
+                .history
+                .iter()
+                .rev()
+                .find(|e| e.outgoing == outgoing && e.shared)
+                .map(|e| e.id)
+        };
+        let clear = Payload::Clear {
+            yours: newest(false),
+            mine: newest(true),
+        };
+        let group_id = contact.group_id.clone();
+        self.send_payload(mux, &group_id, &clear).await?;
+        self.clear_here(name)
     }
 
     /// Send a decoy to `name`: on the wire it looks like a short message;
@@ -389,12 +485,11 @@ impl Node {
             let Some(after) = contact.disappear_after else {
                 continue;
             };
-            let before = contact.history.len();
-            contact.history.retain(|e| e.at.saturating_add(after) > now);
-            if contact.history.len() != before {
+            let old = |at: u64| at.saturating_add(after) <= now;
+            changed |= delete_where(contact, |_, e| old(e.at)) > 0;
+            if contact.cleared_by_them.is_some_and(old) {
+                contact.cleared_by_them = None;
                 changed = true;
-                let incoming = contact.history.iter().filter(|e| !e.outgoing).count();
-                contact.unread = contact.unread.min(incoming as u32);
             }
         }
         if changed {
@@ -433,6 +528,7 @@ impl Node {
         self.rotation_resent.insert(group_id.clone());
         self.send_payload(mux, &group_id, &Payload::Rotate { reply_to })
             .await
+            .map(drop)
     }
 
     /// Housekeeping, to run now and then while connected: delete expired
@@ -473,6 +569,7 @@ impl Node {
                     let reply_to = contact.slot.address.clone();
                     self.send_payload(mux, &group_id, &Payload::Rotate { reply_to })
                         .await
+                        .map(drop)
                 } else {
                     Ok(())
                 }
@@ -681,9 +778,49 @@ impl Node {
                 bail!("dropped a {}-byte message (limit {MAX_TEXT})", text.len())
             }
             Payload::Text(text) => {
+                let id = message_id(ciphertext);
+                if let Some(pos) = contact.gone.iter().position(|g| *g == id) {
+                    // Deleted for both of us while it was on its way.
+                    contact.gone.remove(pos);
+                    return Ok((None, false));
+                }
                 contact.unread = contact.unread.saturating_add(1);
-                let contact = self.record(group_id, false, &text);
+                let contact = self.record(group_id, false, &text, id);
                 Ok((Some(Event::Message { contact, text }), false))
+            }
+            Payload::Delete { id } => {
+                // Only a message they sent: nobody deletes our words for us.
+                if delete_where(contact, |_, e| !e.outgoing && e.shared && e.id == id) == 0 {
+                    remember_gone(contact, id);
+                    return Ok((None, false));
+                }
+                let contact = contact.name.clone();
+                Ok((Some(Event::Deleted { contact }), false))
+            }
+            Payload::Clear { yours, mine } => {
+                // Ours up to the newest they had; any after it are still on
+                // their way to them, so they stay on both sides.
+                let through = yours.and_then(|y| {
+                    contact
+                        .history
+                        .iter()
+                        .rposition(|e| e.outgoing && e.shared && e.id == y)
+                });
+                let had_mine = mine.is_some_and(|m| {
+                    contact
+                        .history
+                        .iter()
+                        .any(|e| !e.outgoing && e.shared && e.id == m)
+                });
+                delete_where(contact, |i, e| {
+                    !e.outgoing || through.is_none_or(|t| i <= t)
+                });
+                if let (Some(m), false) = (mine, had_mine) {
+                    remember_gone(contact, m);
+                }
+                contact.cleared_by_them = Some(unix_now());
+                let contact = contact.name.clone();
+                Ok((Some(Event::Cleared { contact }), false))
             }
             Payload::Rotate { reply_to } if valid_address(&reply_to) => {
                 contact.address = reply_to;
@@ -702,13 +839,14 @@ impl Node {
     }
 
     /// Encrypt `payload` for the conversation `group_id` and send it to the
-    /// contact. Saves either way: the ratchet advanced.
+    /// contact; returns the message's ID. Saves either way: the ratchet
+    /// advanced.
     async fn send_payload<N: Network>(
         &mut self,
         mux: &mut Mux<N>,
         group_id: &[u8],
         payload: &Payload,
-    ) -> Result<()> {
+    ) -> Result<MessageId> {
         let contact = self
             .state
             .contacts
@@ -721,9 +859,10 @@ impl Node {
             .get_mut(group_id)
             .ok_or_else(|| anyhow!("conversation state is missing"))?;
         let ciphertext = session.encrypt(&self.identity, &encode(payload)?)?;
+        let id = message_id(&ciphertext);
         let sent = mux.send(&to, &encode(&Envelope::Mls(ciphertext))?).await;
         self.save()?;
-        sent
+        sent.map(|()| id)
     }
 
     /// Open a brand-new address.
@@ -804,12 +943,14 @@ impl Node {
             history: Vec::new(),
             unread: 0,
             disappear_after: None,
+            gone: Vec::new(),
+            cleared_by_them: None,
         });
         self.sessions.insert(group_id, session);
     }
 
     /// Append to a contact's history; returns the contact's name.
-    fn record(&mut self, group_id: &[u8], outgoing: bool, text: &str) -> String {
+    fn record(&mut self, group_id: &[u8], outgoing: bool, text: &str, id: MessageId) -> String {
         let contact = self
             .state
             .contacts
@@ -820,6 +961,8 @@ impl Node {
             outgoing,
             text: text.to_string(),
             at: unix_now(),
+            id,
+            shared: true,
         });
         let excess = contact.history.len().saturating_sub(HISTORY_LIMIT);
         contact.history.drain(..excess);
@@ -829,6 +972,42 @@ impl Node {
     fn save(&mut self) -> Result<()> {
         self.state.identity = self.identity.snapshot()?;
         self.profile.save(&self.state)
+    }
+}
+
+/// Delete the messages `doomed` picks (given each one's position) from
+/// `contact`'s history, keeping the unread count to the unread ones left.
+/// Returns how many went.
+fn delete_where(contact: &mut Contact, doomed: impl Fn(usize, &HistoryEntry) -> bool) -> usize {
+    let before = contact.history.len();
+    let incoming = contact.history.iter().filter(|e| !e.outgoing).count();
+    // The newest `unread` incoming messages are the unread ones.
+    let first_unread = incoming.saturating_sub(contact.unread as usize);
+    let (mut seen, mut unread_gone) = (0, 0u32);
+    let mut kept = Vec::with_capacity(before);
+    for (i, entry) in std::mem::take(&mut contact.history).into_iter().enumerate() {
+        let unread = !entry.outgoing && {
+            seen += 1;
+            seen > first_unread
+        };
+        if doomed(i, &entry) {
+            unread_gone += u32::from(unread);
+        } else {
+            kept.push(entry);
+        }
+    }
+    contact.history = kept;
+    contact.unread = contact.unread.saturating_sub(unread_gone);
+    before - contact.history.len()
+}
+
+/// Note a message the contact deleted before it arrived.
+fn remember_gone(contact: &mut Contact, id: MessageId) {
+    if !contact.gone.contains(&id) {
+        if contact.gone.len() >= GONE_LIMIT {
+            contact.gone.remove(0);
+        }
+        contact.gone.push(id);
     }
 }
 
@@ -1075,6 +1254,230 @@ mod tests {
             .await?;
         assert!(bob.recv().await.is_err());
         assert_eq!(bob.node.contact("alice")?.disappear_after, None);
+        Ok(())
+    }
+
+    fn texts(peer: &Peer, name: &str) -> Vec<String> {
+        let history = &peer.node.contact(name).unwrap().history;
+        history.iter().map(|e| e.text.clone()).collect()
+    }
+
+    fn id_of(peer: &Peer, name: &str, text: &str) -> MessageId {
+        let history = &peer.node.contact(name).unwrap().history;
+        history.iter().find(|e| e.text == text).unwrap().id
+    }
+
+    #[tokio::test]
+    async fn both_sides_know_a_message_by_the_same_id() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "same").await?;
+        alice.send("bob", "same").await?;
+        bob.recv().await?;
+        bob.recv().await?;
+        let ids = |p: &Peer, name: &str| -> Vec<MessageId> {
+            p.node
+                .contact(name)
+                .unwrap()
+                .history
+                .iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        assert_eq!(ids(&alice, "bob"), ids(&bob, "alice"));
+        assert_ne!(
+            ids(&alice, "bob")[0],
+            ids(&alice, "bob")[1],
+            "same text, new id"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn own_message_is_deleted_for_everyone() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "one").await?;
+        alice.send("bob", "oops").await?;
+        bob.recv().await?;
+        bob.recv().await?;
+        bob.send("alice", "reply").await?;
+        alice.recv().await?;
+        assert_eq!(bob.node.contact("alice")?.unread, 2);
+
+        let oops = id_of(&alice, "bob", "oops");
+        alice
+            .node
+            .delete_for_everyone(&mut alice.mux, "bob", oops)
+            .await?;
+        assert_eq!(texts(&alice, "bob"), ["one", "reply"]);
+        assert_eq!(
+            bob.recv().await?,
+            vec![Event::Deleted {
+                contact: "alice".into()
+            }]
+        );
+        assert_eq!(texts(&bob, "alice"), ["one", "reply"]);
+        assert_eq!(bob.node.contact("alice")?.unread, 1, "the unread one went");
+
+        // Not someone else's message, and only once.
+        let reply = id_of(&alice, "bob", "reply");
+        let err = alice
+            .node
+            .delete_for_everyone(&mut alice.mux, "bob", reply)
+            .await;
+        assert!(err.unwrap_err().to_string().contains("only your own"));
+        assert!(alice
+            .node
+            .delete_for_everyone(&mut alice.mux, "bob", oops)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_delete_cannot_touch_the_receivers_own_messages() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        bob.send("alice", "mine").await?;
+        alice.recv().await?;
+        // A modified app asks Bob to delete his own message.
+        let id = id_of(&bob, "alice", "mine");
+        let group_id = alice.node.contact("bob")?.group_id.clone();
+        alice
+            .node
+            .send_payload(&mut alice.mux, &group_id, &Payload::Delete { id })
+            .await?;
+        assert!(bob.recv().await?.is_empty());
+        assert_eq!(texts(&bob, "alice"), ["mine"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_delete_that_overtakes_its_message_still_deletes_it() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "oops").await?;
+        let oops = id_of(&alice, "bob", "oops");
+        alice
+            .node
+            .delete_for_everyone(&mut alice.mux, "bob", oops)
+            .await?;
+
+        let text = bob.frame().await?;
+        let delete = bob.frame().await?;
+        assert!(bob.deliver(&delete).await?.is_empty());
+        assert!(bob.deliver(&text).await?.is_empty(), "dropped on arrival");
+        assert!(texts(&bob, "alice").is_empty());
+        assert_eq!(bob.node.contact("alice")?.unread, 0);
+        assert!(bob.node.contact("alice")?.gone.is_empty(), "used up");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_here_leaves_the_other_side_alone() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "keep").await?;
+        bob.recv().await?;
+        let id = id_of(&bob, "alice", "keep");
+        bob.node.delete_here("alice", id)?;
+        assert!(texts(&bob, "alice").is_empty());
+        assert_eq!(bob.node.contact("alice")?.unread, 0);
+        assert!(bob.node.delete_here("alice", id).is_err(), "already gone");
+        assert_eq!(texts(&alice, "bob"), ["keep"]);
+        let mut bob = bob.reopen()?;
+        assert!(texts(&bob, "alice").is_empty(), "saved");
+
+        bob.node.clear_here("alice")?;
+        alice.send("bob", "still here").await?;
+        assert_eq!(bob.recv().await?, message("alice", "still here"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_for_everyone_empties_both_and_spares_messages_in_flight() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "a1").await?;
+        bob.recv().await?;
+        bob.send("alice", "b1").await?;
+        alice.recv().await?;
+        // Bob writes while Alice clears; neither has the other's yet.
+        bob.send("alice", "crossing").await?;
+        alice.node.clear_for_everyone(&mut alice.mux, "bob").await?;
+        assert!(texts(&alice, "bob").is_empty());
+
+        assert_eq!(
+            bob.recv().await?,
+            vec![Event::Cleared {
+                contact: "alice".into()
+            }]
+        );
+        assert_eq!(texts(&bob, "alice"), ["crossing"]);
+        assert!(bob.node.contact("alice")?.cleared_by_them.is_some());
+        assert_eq!(bob.node.contact("alice")?.unread, 0);
+        assert_eq!(alice.recv().await?, message("bob", "crossing"));
+        assert_eq!(texts(&alice, "bob"), ["crossing"], "both sides match");
+
+        // Emptying it ourselves takes the note away.
+        bob.node.clear_here("alice")?;
+        assert!(bob.node.contact("alice")?.cleared_by_them.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_clear_that_overtakes_the_last_message_still_clears_it() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "first").await?;
+        bob.recv().await?;
+        alice.send("bob", "late").await?;
+        alice.node.clear_for_everyone(&mut alice.mux, "bob").await?;
+
+        let late = bob.frame().await?;
+        let clear = bob.frame().await?;
+        assert_eq!(bob.deliver(&clear).await?.len(), 1);
+        assert!(bob.deliver(&late).await?.is_empty());
+        assert!(texts(&bob, "alice").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn messages_from_before_ids_are_deleted_only_here() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "old").await?;
+        bob.recv().await?;
+        alice.node.state.contacts[0].history[0].shared = false;
+        let id = id_of(&alice, "bob", "old");
+        let err = alice
+            .node
+            .delete_for_everyone(&mut alice.mux, "bob", id)
+            .await;
+        assert!(err.unwrap_err().to_string().contains("for yourself"));
+        alice.node.delete_here("bob", id)?;
+
+        // A whole-chat clear still reaches every message on their side.
+        alice.node.clear_for_everyone(&mut alice.mux, "bob").await?;
+        bob.recv().await?;
+        assert!(texts(&bob, "alice").is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_cleared_note_disappears_with_the_messages() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        bob.node
+            .set_timer(&mut bob.mux, "alice", Some(3600))
+            .await?;
+        alice.recv().await?;
+        alice.node.clear_for_everyone(&mut alice.mux, "bob").await?;
+        bob.recv().await?;
+        bob.node.state.contacts[0].cleared_by_them = Some(unix_now() - 2 * 3600);
+        bob.node.expire()?;
+        assert!(bob.node.contact("alice")?.cleared_by_them.is_none());
         Ok(())
     }
 

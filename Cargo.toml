@@ -49,6 +49,8 @@ windows-sys = { version = "0.59", features = [
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = "1"
+# Message IDs (already in the tree via OpenMLS).
+sha2 = "0.10"
 
 # --- Content-encryption layer (crates.io, stable) ---
 openmls = "0.6"

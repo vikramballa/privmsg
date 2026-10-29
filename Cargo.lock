@@ -6126,6 +6126,7 @@ dependencies = [
  "rpassword",
  "security-framework 2.11.1",
  "serde",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",

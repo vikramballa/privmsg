@@ -285,6 +285,8 @@ users on your computer, connects them, and opens a chat window for each.
 | `privmsg listen [seconds]` | Just receive messages (Ctrl-C to stop) |
 | `privmsg contacts` | List contacts, unread counts and unused invites |
 | `privmsg history <name>` | Show saved messages with a contact |
+| `privmsg clear <name> [everyone]` | Delete every message with a contact, on your side only or on both sides |
+| `privmsg unsend <name>` | Delete your last message to a contact, on both sides |
 | `privmsg disappear <name> [off\|5m\|1h\|1d\|1w]` | Show or set disappearing messages with a contact (applies on both sides) |
 | `privmsg verify <name>` | Show the safety number to compare with a contact |
 | `privmsg rotate <name>` | Move a conversation to a new address now (it also happens weekly by itself) |
@@ -383,6 +385,23 @@ deletes them too, and messages already older than that go at once. Deleted
 messages are removed from the encrypted `state.enc`; a disk can keep old
 copies of that file for a while, but they're still locked with your
 passphrase.
+
+### Deleting messages and chats
+
+In the app, `/clear` empties the chat on your side and `/clear everyone`
+on both sides (your contact sees that you cleared it). `/unsend` deletes
+your last message on both sides. From the command line it's `privmsg clear
+<name> [everyone]` and `privmsg unsend <name>`. On the iPhone, press and
+hold a message, or use **⋯ → Delete chat**.
+
+- You can delete only **your own** messages for everyone. A deleted
+  message leaves no trace in the chat.
+- "For everyone" is a request to your contact's app. If they already read
+  it or took a screenshot, it's too late, and a modified app could ignore it.
+- If their app stays closed for more than about a day, the request expires
+  on the network, as a message would, and the message stays on their side.
+- Your contact needs a version with deleting. Older versions ignore it.
+- Messages from before this version can only be deleted on your side.
 
 ---
 
