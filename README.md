@@ -68,6 +68,19 @@ Press **Ctrl-D** in a chat. Both sides delete
 ask your contacts to update too. Your existing profile is upgraded
 automatically, contacts and history included.
 
+**Since v0.2.0** (not in the ready-made download yet;
+[build it yourself](#build-it-yourself-mac-and-linux) to get these):
+- **Delete messages and chats**, for you or for everyone (see
+  [Deleting messages and chats](#deleting-messages-and-chats)).
+- **More reliable delivery.** Messages no longer get lost when an app
+  closes or reconnects, a dead connection is replaced by itself, and the
+  app reconnects instead of quitting when your internet drops.
+- **Replays are refused**, even after a restart.
+- **With decoys on, everything waits for a decoy**, including deletes and
+  timer or address changes, so none of them shows when you're active.
+- Still talks to v0.2.0. Once you open your profile with this version,
+  older versions can't open it any more.
+
 ---
 
 ## How it works
@@ -462,9 +475,9 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 ## What it protects (and what it doesn't)
 
 **Protected ✅**
-- **Message content:** end-to-end encrypted, with forward secrecy (each
-  message key is deleted once used, so a later leak doesn't expose
-  earlier messages).
+- **Message content:** end-to-end encrypted, with forward secrecy (message
+  keys are deleted once used, so a later leak doesn't expose earlier
+  messages; see the note on received messages below).
 - **Tampering:** forged, modified or replayed messages are rejected.
 - **Who talks to whom:** hidden by the mixnet.
 - **Your IP address:** the mixnet hides it from your contacts, and Tor hides
@@ -498,6 +511,10 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
   read new messages too until you remove the contact and connect again.
   (MLS can heal from this with regular key updates; privmsg doesn't do
   them yet.)
+- **Keys of messages you've received:** they stay in your (encrypted)
+  profile until you next send that contact something. Someone with your
+  profile *and* your passphrase could read those messages again until
+  then. (A limit of the encryption library, OpenMLS 0.6.)
 - **A hacked device:** if someone controls your computer, no messenger can
   protect you.
 - **Small user base:** a mixnet hides you in a crowd, so the more people use
@@ -524,7 +541,10 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 | `Tor could not connect within 3 minutes` | Check your internet. If Tor is blocked where you are, use `privmsg tor off` for now. |
 | Mac: `"tor" can't be opened` or privmsg is "killed" | Run `xattr -dr com.apple.quarantine .` inside the privmsg folder. |
 | Linux: `GLIBC_2.39 not found` (or a similar version) | Your Linux is older than the system the download was built on. [Build it yourself](#build-it-yourself-mac-and-linux) instead; that always works. |
-| Your contact never gets your messages | Check that you both run v0.2.0. Older versions can't read newer messages. |
+| Your contact never gets your messages | Check that you both run v0.2.0 or newer. Older versions can't read newer messages. |
+| `Connection lost… Reconnecting…` | Your internet dropped or the Nym gateway went away. privmsg reconnects by itself (5 tries, 20 s apart). |
+| `ignored an incoming message: refused a replayed message` | Someone resent a message you already got. It was blocked; nothing to do. |
+| `… is not a privmsg profile` after going back to an older version | A profile opened by a newer version can't be opened by older ones. Install the newer version again. |
 
 ---
 
