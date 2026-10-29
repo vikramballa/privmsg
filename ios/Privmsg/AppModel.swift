@@ -6,12 +6,14 @@ import UIKit
 @Observable
 @MainActor
 final class AppModel {
-    enum Phase {
+    enum Phase: Equatable {
         /// No profile yet: choose a passphrase.
         case setup
         /// A profile, still locked.
         case locked
         case ready
+        /// The identity was erased; how telling the contacts went.
+        case erased(String)
     }
 
     private(set) var phase: Phase
@@ -29,6 +31,8 @@ final class AppModel {
 
     private(set) var messenger: Messenger?
     private let profileDirectory = Storage.profileDirectory()
+    /// Guards the profile's device key with the Secure Enclave.
+    private let vault = SecureEnclaveVault()
     private var backgroundSince: Date?
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var noticeTask: Task<Void, Never>?
@@ -40,20 +44,22 @@ final class AppModel {
     }
 
     init() {
-        phase = profileExists(dir: profileDirectory.path) ? .locked : .setup
+        phase = profileExists(dir: profileDirectory.path, vault: vault) ? .locked : .setup
     }
 
     // MARK: Starting
 
     func create(passphrase: String) async throws {
+        let vault = vault
         try await start { dir, listener in
-            try Messenger.create(dir: dir, passphrase: passphrase, listener: listener)
+            try Messenger.create(dir: dir, passphrase: passphrase, vault: vault, listener: listener)
         }
     }
 
     func unlock(passphrase: String) async throws {
+        let vault = vault
         try await start { dir, listener in
-            try Messenger.open(dir: dir, passphrase: passphrase, listener: listener)
+            try Messenger.open(dir: dir, passphrase: passphrase, vault: vault, listener: listener)
         }
     }
 
@@ -182,6 +188,20 @@ final class AppModel {
 
     func apply(_ settings: SettingsInfo) async throws {
         try await messenger?.setSettings(settings: settings)
+    }
+
+    /// Erase the identity for good (see `Messenger.eraseIdentity`). Throws,
+    /// changing nothing, if the password is wrong.
+    func eraseIdentity(passphrase: String, tellContacts: Bool) async throws {
+        guard let messenger else { throw MobileError.Failed(message: "Not started yet.") }
+        let note = try await messenger.eraseIdentity(
+            passphrase: passphrase, tellContacts: tellContacts)
+        self.messenger = nil
+        contacts = []
+        invites = []
+        settings = nil
+        screenLocked = false
+        phase = .erased(note)
     }
 
     func retry() {

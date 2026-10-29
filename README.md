@@ -70,6 +70,13 @@ automatically, contacts and history included.
 
 **Since v0.2.0** (not in the ready-made download yet;
 [build it yourself](#build-it-yourself-mac-and-linux) to get these):
+- **Erase your identity**: one command (`/delete` → 3 in the app,
+  `privmsg erase`, or **Settings → Erase my identity** on the iPhone)
+  destroys every message, contact and key on the device for good, and can
+  ask your contacts' apps to delete your chats too (see
+  [Erasing your identity](#erasing-your-identity)).
+- **Your Nym network keys are now encrypted** inside your profile, with
+  everything else (they used to sit in an unencrypted `slots/` folder).
 - **Delete messages and chats**, for you or for everyone (see
   [Deleting messages and chats](#deleting-messages-and-chats)).
 - **More reliable delivery.** Messages no longer get lost when an app
@@ -79,7 +86,9 @@ automatically, contacts and history included.
 - **With decoys on, everything waits for a decoy**, including deletes and
   timer or address changes, so none of them shows when you're active.
 - Still talks to v0.2.0. Once you open your profile with this version,
-  older versions can't open it any more.
+  older versions can't open it any more. It also gets a **device key**
+  (`device.key`): moving or backing up a profile now means copying the
+  whole folder; `state.enc` alone can't be opened.
 
 ---
 
@@ -304,6 +313,7 @@ users on your computer, connects them, and opens a chat window for each.
 | `privmsg verify <name>` | Show the safety number to compare with a contact |
 | `privmsg rotate <name>` | Move a conversation to a new address now (it also happens weekly by itself) |
 | `privmsg remove <name>` | Forget a contact or unused invite, with its addresses and keys |
+| `privmsg erase` | Erase your identity: every message, contact and key on this device, for good (asks first; see [Erasing your identity](#erasing-your-identity)) |
 | `privmsg address` | Show your mix address for each contact |
 | `privmsg decoys [on\|off\|<seconds>]` | Show or set decoy traffic (see below) |
 | `privmsg data [saver\|balanced\|maximum]` | Show or set how much internet data privmsg uses (see below) |
@@ -333,10 +343,14 @@ other PCs and OneDrive doesn't back up):
 
 | File | Contents | Protected? |
 |---|---|---|
-| `state.enc` | Your keys, contacts, conversations, message history | ✅ Encrypted with your passphrase (Argon2id, 64 MiB × 3 passes, + XChaCha20-Poly1305) |
-| `slots/` | One folder of Nym network keys per address (one per contact and per open invite, plus `sender`, which sends everything) | ⚠️ Not encrypted by privmsg, only by folder permissions: only your user account can open the profile folder (mode 0700 on Mac and Linux; on Windows an access list with your account as the only entry) |
-| `tor/` | Tor's directory cache and entry guards, so later starts are quick | Folder permissions, like `slots/` |
+| `state.enc` | Your keys, contacts, conversations, message history, and the Nym network keys of every address | ✅ Encrypted with a key made from your passphrase (Argon2id, 64 MiB × 3 passes) **and** the device key, with XChaCha20-Poly1305 |
+| `device.key` | The device key: 32 random bytes. Without it, `state.enc` can't be opened, even with your passphrase | Folder permissions (on the iPhone: sealed by a key in the Secure Enclave) |
+| `tor/` | Tor's directory cache and entry guards, so later starts are quick | Folder permissions: only your user account can open the profile folder (mode 0700 on Mac and Linux; on Windows an access list with your account as the only entry) |
 | `lock` | Stops two copies of privmsg using the same profile | — |
+
+Older versions kept the Nym keys unencrypted in a `slots/` folder. The
+first time this version connects, it moves them into `state.enc` and
+overwrites and deletes that folder.
 
 🔑 **There is no password recovery.** If you forget your passphrase, your
 profile can't be opened. That's by design.
@@ -417,6 +431,53 @@ hold a message, or use **⋯ → Delete chat**.
 - Your contact needs a version with deleting. Older versions ignore it.
 - Messages from before this version can only be deleted on your side.
 
+### Erasing your identity
+
+A kill switch for everything privmsg has on the device. In the app, type
+`/delete` and press **3**; from the command line, `privmsg erase`; on the
+iPhone, **Settings → Erase my identity**. You then:
+
+1. read what is erased and what can't be reached, and type `ERASE`;
+2. choose whether to ask your contacts' apps to delete your chats (your
+   messages and theirs) and forget you. They see that you erased your
+   identity. If you say no, they keep their copies;
+3. type your password. After 3 wrong ones, each further try waits longer
+   (5 seconds, doubling up to about 5 minutes).
+
+Then privmsg tells your contacts (if you chose that; at most a minute or
+so), destroys the **device key**, overwrites every file of the profile
+with random data, deletes it, and removes a password saved in the macOS
+keychain. If the battery dies halfway, the erase finishes the next time
+privmsg starts.
+
+**Why it can't be undone, even with special tools.** Deleting files isn't
+enough on SSDs and phones: they keep old copies of data where no delete
+can reach ([Wei et al., FAST 2011](https://www.usenix.org/legacy/events/fast11/tech/full_papers/Wei.pdf)).
+So privmsg uses *crypto-erase*, the method in the US standard for wiping
+storage ([NIST SP 800-88 Rev. 2](https://csrc.nist.gov/pubs/sp/800/88/r2/final))
+and the one iPhones use for "Erase All Content and Settings": everything
+is encrypted with a key made from your passphrase **and** a random 256-bit
+device key, and erasing destroys the device key. Every copy of your profile
+ever written, wherever it lingers, then turns into noise: your password no
+longer opens it, and guessing the device key means trying about 10^77
+keys. On the iPhone, the device key is sealed by a key inside the Secure
+Enclave chip, which never leaves it; erasing deletes that key.
+
+**What it can't reach:**
+- copies on other devices: what your contacts have (unless you ask their
+  apps to delete it, and a modified app could ignore that), screenshots,
+  or a copy of your disk someone made earlier;
+- on computers, the device key is an ordinary file, so its own leftovers
+  are only as gone as the drive makes them. Turn on full-disk encryption
+  (FileVault, BitLocker, LUKS) to cover that. Macs with Apple silicon
+  encrypt each file with its own key anyway;
+- copies of `state.enc` made by versions before this one, which only your
+  passphrase locked;
+- Tor's folder on the iPhone, which Tor (built into the app) can recreate
+  until you close privmsg. It holds nothing about you;
+- deleting data can be against the law when it is evidence, for example
+  during a search or under a court order.
+
 ---
 
 ## Internet data and Tor
@@ -485,7 +546,10 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 - **Message length:** messages are padded to fixed-size blocks.
 - **Identity:** no accounts or phone numbers. Contact nicknames never leave
   your device, and invite codes work only once.
-- **Data on disk:** encrypted with your passphrase.
+- **Data on disk:** encrypted with your passphrase and a device key.
+- **Your data after you erase it:** destroyed for good, including copies
+  your storage kept behind the scenes (see
+  [Erasing your identity](#erasing-your-identity)).
 - **Linking your conversations:** each contact gets its own address and
   its own encryption keys, and addresses rotate weekly.
 - **Someone intercepting an invite:** compare the safety number
@@ -505,7 +569,6 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 - **Long-term traffic analysis by a very powerful observer:** cover traffic
   and decoys help a lot, but there's no formal guarantee. Being online at
   all is still visible.
-- **The `slots/` folder** isn't encrypted by privmsg.
 - **Recovery after a key leak:** conversation keys are never refreshed
   after a conversation starts, so if someone copies your keys they can
   read new messages too until you remove the contact and connect again.
@@ -545,6 +608,8 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 | `Connection lost… Reconnecting…` | Your internet dropped or the Nym gateway went away. privmsg reconnects by itself (5 tries, 20 s apart). |
 | `ignored an incoming message: refused a replayed message` | Someone resent a message you already got. It was blocked; nothing to do. |
 | `… is not a privmsg profile` after going back to an older version | A profile opened by a newer version can't be opened by older ones. Install the newer version again. |
+| `this profile's device key (…device.key) is missing` | The profile was erased, or `state.enc` was copied without `device.key`. Copy the whole profile folder. |
+| `Too many wrong passwords. Try again in … seconds.` | The erase confirmation waits after several wrong passwords. Wait, then try again. |
 
 ---
 
@@ -561,6 +626,8 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
   - [x] Internal security review pass
   - [ ] Independent security audit
   - [x] Optional passphrase storage in the OS keychain (macOS)
+  - [x] Erase your identity for good (crypto-erase with a device key;
+        Secure Enclave on the iPhone), Nym keys encrypted in the profile
 - [x] **Phase 2: unlinkable conversations**
   - [x] Separate mix address per contact
   - [x] Automatic address rotation

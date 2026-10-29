@@ -5,7 +5,7 @@
 //!   └─ Envelope::Join { welcome, hello }   first contact
 //!      Envelope::Mls(ciphertext)           everything after
 //!         └─ MLS-encrypted Payload::Hello / Text / Rotate / RotateAck / Timer
-//!                                  / Delete / Clear
+//!                                  / Delete / Clear / Gone
 //!      Envelope::Decoy(random)             cover, discarded on arrival
 //! ```
 //!
@@ -122,6 +122,10 @@ pub enum Payload {
         yours: Option<MessageId>,
         mine: Option<MessageId>,
     },
+    /// "I erased my identity." Sent to every contact just before an erase:
+    /// the receiver deletes the whole chat and forgets the contact. (Sent
+    /// after a `Clear`, which versions that don't know `Gone` still obey.)
+    Gone,
 }
 
 /// Both sides' name for one message, without sending one: each side hashes

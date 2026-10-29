@@ -12,6 +12,10 @@
 //! a command to the loop, awaited from Swift with `async`. The loop reports
 //! back through the app's [`Listener`]: connection status, "something
 //! changed, read again", and short notices for the user.
+//!
+//! The profile's device key is sealed by the app's [`KeyVault`] — on the
+//! iPhone, with a key in the Secure Enclave — so erasing the identity
+//! ([`Messenger::erase_identity`]) can destroy it where no copy survives.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
@@ -19,7 +23,8 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use privmsg_node::app::{Node, TIMERS};
-use privmsg_node::store::{Profile, Settings, MIN_PASSPHRASE};
+use privmsg_node::secure::harden_process;
+use privmsg_node::store::{shred_dir, Profile, Settings, Vault, MIN_PASSPHRASE};
 use privmsg_node::wire::Invite;
 use privmsg_transport::{DataMode, NymNetwork, Tor};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -59,6 +64,12 @@ impl std::fmt::Display for MobileError {
 }
 
 impl std::error::Error for MobileError {}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for MobileError {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        MobileError::Failed { message: e.reason }
+    }
+}
 
 impl From<anyhow::Error> for MobileError {
     fn from(e: anyhow::Error) -> Self {
@@ -180,10 +191,49 @@ pub trait Listener: Send + Sync {
     fn notice(&self, text: String);
 }
 
-/// Whether `dir` holds a profile (open it) or not (create one).
+/// Guards the profile's device key: the app implements it with a key that
+/// lives in the Secure Enclave. What `seal` returns is stored in the
+/// profile; after `destroy`, nothing sealed may ever be opened again.
+#[uniffi::export(with_foreign)]
+pub trait KeyVault: Send + Sync {
+    fn seal(&self, key: Vec<u8>) -> Result<Vec<u8>, MobileError>;
+    fn unseal(&self, sealed: Vec<u8>) -> Result<Vec<u8>, MobileError>;
+    fn destroy(&self) -> Result<(), MobileError>;
+}
+
+/// The app's [`KeyVault`] as the profile's [`Vault`].
+struct AppVault(Arc<dyn KeyVault>);
+
+impl Vault for AppVault {
+    fn seal(&self, key: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Ok(self.0.seal(key.to_vec())?)
+    }
+
+    fn unseal(&self, sealed: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        Ok(Zeroizing::new(self.0.unseal(sealed.to_vec())?))
+    }
+
+    fn destroy(&self) -> anyhow::Result<()> {
+        Ok(self.0.destroy()?)
+    }
+}
+
+/// Whether `dir` holds a profile (open it) or not (create one). Finishes
+/// an erase that was cut short first, and clears what an erase leaves
+/// behind while the app is still running (Tor's folder).
 #[uniffi::export]
-pub fn profile_exists(dir: String) -> bool {
-    Profile::exists(&PathBuf::from(dir))
+pub fn profile_exists(dir: String, vault: Arc<dyn KeyVault>) -> bool {
+    let dir = PathBuf::from(dir);
+    if let Err(e) = Profile::finish_erase(&dir, &AppVault(vault)) {
+        tracing::warn!("finishing an erase: {e:#}");
+    }
+    let exists = Profile::exists(&dir);
+    if !exists {
+        if let Err(e) = shred_dir(&dir.join("tor")) {
+            tracing::warn!("clearing Tor's old folder: {e:#}");
+        }
+    }
+    exists
 }
 
 /// Shortest passphrase a new profile accepts.
@@ -225,18 +275,21 @@ pub struct Messenger {
 
 #[uniffi::export]
 impl Messenger {
-    /// Make a new profile in `dir`, locked with `passphrase`, and start.
+    /// Make a new profile in `dir`, locked with `passphrase` and with its
+    /// device key sealed by `vault`, and start.
     #[uniffi::constructor]
     pub fn create(
         dir: String,
         passphrase: String,
+        vault: Arc<dyn KeyVault>,
         listener: Arc<dyn Listener>,
     ) -> Result<Arc<Self>, MobileError> {
         let passphrase = Zeroizing::new(passphrase);
         if passphrase.chars().count() < MIN_PASSPHRASE {
             return Err(anyhow!("Use at least {MIN_PASSPHRASE} characters.").into());
         }
-        Self::start(dir.into(), passphrase, true, listener, nym)
+        let vault = Arc::new(AppVault(vault));
+        Self::start(dir.into(), passphrase, true, vault, listener, nym)
     }
 
     /// Unlock the profile in `dir` and start. Takes a moment: the
@@ -245,9 +298,18 @@ impl Messenger {
     pub fn open(
         dir: String,
         passphrase: String,
+        vault: Arc<dyn KeyVault>,
         listener: Arc<dyn Listener>,
     ) -> Result<Arc<Self>, MobileError> {
-        Self::start(dir.into(), Zeroizing::new(passphrase), false, listener, nym)
+        let vault = Arc::new(AppVault(vault));
+        Self::start(
+            dir.into(),
+            Zeroizing::new(passphrase),
+            false,
+            vault,
+            listener,
+            nym,
+        )
     }
 
     pub fn status(&self) -> ConnectionStatus {
@@ -361,6 +423,26 @@ impl Messenger {
             .await
     }
 
+    /// Erase the identity for good: every message, contact and key on this
+    /// phone, and the device key, so no leftover copy can ever be opened.
+    /// With `tell_contacts`, first ask every contact's app to delete the
+    /// chat and forget us. Refused (nothing happens) unless `passphrase` is
+    /// right; after a few wrong ones each try has to wait. On success the
+    /// messenger stops; returns a note on how telling the contacts went.
+    pub async fn erase_identity(
+        &self,
+        passphrase: String,
+        tell_contacts: bool,
+    ) -> Result<String, MobileError> {
+        let passphrase = Zeroizing::new(passphrase);
+        self.ask(|reply| Command::Erase {
+            passphrase,
+            tell: tell_contacts,
+            reply,
+        })
+        .await
+    }
+
     /// Whether `passphrase` is this profile's (for the app's lock screen).
     pub async fn check_passphrase(&self, passphrase: String) -> bool {
         let (reply, answer) = oneshot::channel();
@@ -396,6 +478,7 @@ impl Messenger {
         dir: PathBuf,
         passphrase: Zeroizing<String>,
         create: bool,
+        vault: Arc<dyn Vault>,
         listener: Arc<dyn Listener>,
         make: impl FnOnce(&Node, Arc<Shared>) -> F + Send + 'static,
     ) -> Result<Arc<Self>, MobileError>
@@ -405,6 +488,7 @@ impl Messenger {
         Fut: std::future::Future<Output = anyhow::Result<N>>,
     {
         init_logging();
+        harden_process();
         let shared = Arc::new(Shared {
             view: Mutex::new(View::default()),
             listener,
@@ -417,9 +501,9 @@ impl Messenger {
             .stack_size(STACK_SIZE)
             .spawn(move || {
                 let node = if create {
-                    Node::create(&dir, &passphrase)
+                    Node::create_with(&dir, &passphrase, vault)
                 } else {
-                    Node::open(&dir, &passphrase)
+                    Node::open_with(&dir, &passphrase, vault)
                 };
                 drop(passphrase);
                 let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -428,13 +512,18 @@ impl Messenger {
                     .thread_stack_size(STACK_SIZE)
                     .build()
                     .map_err(anyhow::Error::from);
-                let (node, runtime) = match (node, runtime) {
+                let (mut node, runtime) = match (node, runtime) {
                     (Ok(node), Ok(runtime)) => (node, runtime),
                     (Err(e), _) | (_, Err(e)) => {
                         let _ = ready.send(Err(e));
                         return;
                     }
                 };
+                // Older versions kept the Nym keys in files of their own.
+                if let Err(e) = runtime.block_on(node.adopt_nym_files()) {
+                    let _ = ready.send(Err(e));
+                    return;
+                }
                 {
                     // So the app has contacts and messages to show at once.
                     let mut view = thread_shared.view.lock().expect("view lock");
@@ -476,12 +565,12 @@ impl Messenger {
 
 /// The real network: Tor first (if on), then the Nym mixnet behind it.
 fn nym(node: &Node, shared: Arc<Shared>) -> impl FnMut() -> NymStart {
-    let (slots, tor_dir) = (node.slots_dir(), node.tor_dir());
+    let (keys, tor_dir) = (node.nym_keys(), node.tor_dir());
     let (mode, tor) = (node.settings().data_mode, node.settings().tor);
     move || {
-        let (slots, tor_dir, shared) = (slots.clone(), tor_dir.clone(), shared.clone());
+        let (keys, tor_dir, shared) = (keys.clone(), tor_dir.clone(), shared.clone());
         Box::pin(async move {
-            let mut net = NymNetwork::new(slots, mode);
+            let mut net = NymNetwork::new(keys, mode);
             if tor {
                 let progress = |percent| shared.status(ConnectionStatus::StartingTor { percent });
                 net = net.with_tor(start_tor(&tor_dir, progress).await?)?;

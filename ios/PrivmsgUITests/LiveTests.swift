@@ -7,7 +7,10 @@ import XCTest
 /// without the linked-in Tor starts tor as a program), then send
 /// "hi phone" from the desktop once it has the phone's message. The phone
 /// then sends "delete me" and deletes it for everyone; once the desktop has
-/// seen that, run `privmsg clear <name> everyone` there.
+/// seen that, run `privmsg clear <name> everyone` there. Last, the phone
+/// erases its identity, telling the desktop, which then shows that the
+/// phone erased their identity and drops the chat. `testEraseIdentity`
+/// needs nothing.
 final class LiveTests: XCTestCase {
     private let passphrase = "simulator test passphrase"
 
@@ -55,6 +58,56 @@ final class LiveTests: XCTestCase {
         app.buttons["Invite a friend"].tap()
         XCTAssertTrue(app.buttons["Make an invite"].waitForExistence(timeout: 5))
         screenshot("invite")
+    }
+
+    /// Settings → Erase my identity, with `password`: a wrong one first.
+    private func erase(_ app: XCUIApplication, password: String) {
+        app.buttons["Settings"].tap()
+        let open = app.buttons["erase"]
+        for _ in 0..<5 where !open.isHittable { app.swipeUp() }
+        open.tap()
+        let word = app.textFields["eraseWord"]
+        XCTAssertTrue(word.waitForExistence(timeout: 5))
+        word.tap()
+        word.typeText("ERASE")
+        let field = app.secureTextFields["erasePassword"]
+        field.tap()
+        field.typeText("not my password")
+        let button = app.buttons["eraseEverything"]
+        for _ in 0..<5 where !button.isHittable { app.swipeUp() }
+        button.tap()
+        app.alerts.buttons["Erase"].tap()
+        let wrong = app.staticTexts["Wrong password."]
+        XCTAssertTrue(wrong.waitForExistence(timeout: 30), "a wrong password changes nothing")
+        screenshot("erase-wrong-password")
+
+        for _ in 0..<5 where !field.isHittable { app.swipeDown() }
+        field.tap()
+        field.press(forDuration: 1.0)
+        if app.menuItems["Select All"].waitForExistence(timeout: 2) {
+            app.menuItems["Select All"].tap()
+        }
+        field.typeText(XCUIKeyboardKey.delete.rawValue)
+        field.typeText(password)
+        for _ in 0..<5 where !button.isHittable { app.swipeUp() }
+        screenshot("erase-ready")
+        button.tap()
+        app.alerts.buttons["Erase"].tap()
+        XCTAssertTrue(app.staticTexts["Erased"].waitForExistence(timeout: 120))
+        screenshot("erased")
+    }
+
+    func testEraseIdentity() {
+        var app = launch()
+        createProfile(app)
+        erase(app, password: passphrase)
+        // Opened again, it starts fresh.
+        app.terminate()
+        app = launch()
+        XCTAssertTrue(
+            app.secureTextFields["Password (at least 12 characters)"].waitForExistence(timeout: 10),
+            "nothing is left to unlock")
+        screenshot("fresh-after-erase")
     }
 
     func testTalksToDesktop() throws {
@@ -110,6 +163,12 @@ final class LiveTests: XCTestCase {
         XCTAssertTrue(cleared.waitForExistence(timeout: 900), "the desktop empties the chat")
         XCTAssertFalse(app.staticTexts["hi phone"].exists, "for both sides")
         screenshot("cleared")
+
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        erase(app, password: passphrase)
+        XCTAssertTrue(
+            app.staticTexts["Your contact was asked to delete your chat."].exists,
+            "the desktop was told")
     }
 
     private func gone(_ element: XCUIElement, within seconds: TimeInterval) -> Bool {

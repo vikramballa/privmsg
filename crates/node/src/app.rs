@@ -38,20 +38,25 @@
 //!
 //! Every state change is saved immediately: the MLS ratchet moves on each
 //! message, and losing that state would make later messages undecryptable.
+//!
+//! Erasing (`Node::erase`) destroys the profile for good; `say_goodbye`
+//! first tells every contact's app to delete the chat and forget us.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::OsRng;
 use privmsg_crypto::{decode_key_package, encode_key_package, message_group_id, Identity, Session};
-use privmsg_transport::{MixAddress, Mux, Network};
+use privmsg_transport::{MixAddress, Mux, Network, NymKeys};
+use zeroize::Zeroize;
 
 use crate::store::{
     Contact, HistoryEntry, OldSlot, PendingInvite, PendingMessage, Profile, Settings, Slot, State,
-    GONE_LIMIT, HISTORY_LIMIT, SEEN_LIMIT,
+    Vault, GONE_LIMIT, HISTORY_LIMIT, SEEN_LIMIT,
 };
 use crate::wire::{
     decode, encode, message_id, valid_address, Envelope, Invite, MessageId, Payload,
@@ -87,6 +92,10 @@ pub const TIMERS: [(u64, &str); 4] = [
 
 /// Bounds on a timer set by the contact.
 const TIMER_RANGE: std::ops::RangeInclusive<u64> = 60..=365 * 24 * 3600;
+
+/// Wrong passwords allowed in a row by [`Node::verify_passphrase`] before
+/// each further try has to wait: 5 seconds, doubling up to about 5 minutes.
+const FREE_TRIES: u32 = 3;
 
 /// `"off"` or one of [`TIMERS`]' words.
 pub fn parse_timer(word: &str) -> Result<Option<u64>> {
@@ -151,6 +160,11 @@ pub enum Event {
     Cleared {
         contact: String,
     },
+    /// The contact erased their identity: the chat and the contact are
+    /// gone.
+    Gone {
+        contact: String,
+    },
 }
 
 pub struct Node {
@@ -165,12 +179,31 @@ pub struct Node {
     /// With decoys on: every frame for a conversation, oldest first, until
     /// its next decoy tick ([`Node::tick`]). `None`: frames go out at once.
     held: Option<HashMap<Vec<u8>, VecDeque<Vec<u8>>>>,
+    /// The Nym clients' keys, shared with the network; saved with the state.
+    nym: NymKeys,
+    /// Wrong passwords in a row, and when the next try is allowed.
+    wrong_tries: u32,
+    retry_at: Option<Instant>,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.state.wipe();
+    }
 }
 
 impl Node {
     /// Create a new profile with a fresh identity.
     pub fn create(dir: &Path, passphrase: &str) -> Result<Self> {
-        let profile = Profile::create(dir, passphrase)?;
+        Self::finish(Profile::create(dir, passphrase)?)
+    }
+
+    /// Create a new profile whose device key `vault` guards.
+    pub fn create_with(dir: &Path, passphrase: &str, vault: Arc<dyn Vault>) -> Result<Self> {
+        Self::finish(Profile::create_with(dir, passphrase, vault)?)
+    }
+
+    fn finish(profile: Profile) -> Result<Self> {
         // The MLS credential carries a random label, not a user-chosen name,
         // so nothing in a KeyPackage identifies the person behind it.
         let identity = Identity::new(&hex(&random::<16>()))?;
@@ -181,7 +214,15 @@ impl Node {
 
     /// Unlock an existing profile and reopen every conversation.
     pub fn open(dir: &Path, passphrase: &str) -> Result<Self> {
-        let (profile, state) = Profile::open(dir, passphrase)?;
+        Self::reopen(Profile::open(dir, passphrase)?)
+    }
+
+    /// Unlock a profile whose device key `vault` guards.
+    pub fn open_with(dir: &Path, passphrase: &str, vault: Arc<dyn Vault>) -> Result<Self> {
+        Self::reopen(Profile::open_with(dir, passphrase, vault)?)
+    }
+
+    fn reopen((profile, state): (Profile, State)) -> Result<Self> {
         let identity = Identity::restore(&state.identity)?;
         let mut sessions = HashMap::new();
         for contact in &state.contacts {
@@ -201,6 +242,7 @@ impl Node {
         sessions: HashMap<Vec<u8>, Session>,
     ) -> Self {
         Self {
+            nym: NymKeys::new(state.nym.clone()),
             profile,
             state,
             identity,
@@ -208,12 +250,121 @@ impl Node {
             opened: HashMap::new(),
             rotation_resent: HashSet::new(),
             held: None,
+            wrong_tries: 0,
+            retry_at: None,
         }
     }
 
     /// Whether `passphrase` unlocks this profile (for a screen lock).
     pub fn check_passphrase(&self, passphrase: &str) -> bool {
         self.profile.check_passphrase(passphrase)
+    }
+
+    /// Check `passphrase` before something that can't be undone. After
+    /// [`FREE_TRIES`] wrong ones in a row, each further try has to wait
+    /// longer, so this can't be used to guess the password quickly.
+    pub fn verify_passphrase(&mut self, passphrase: &str) -> Result<()> {
+        if let Some(wait) = self
+            .retry_at
+            .map(|at| at.saturating_duration_since(Instant::now()))
+        {
+            if !wait.is_zero() {
+                bail!(
+                    "Too many wrong passwords. Try again in {} seconds.",
+                    wait.as_secs() + 1
+                );
+            }
+        }
+        if self.profile.check_passphrase(passphrase) {
+            self.wrong_tries = 0;
+            self.retry_at = None;
+            return Ok(());
+        }
+        self.wrong_tries += 1;
+        if self.wrong_tries < FREE_TRIES {
+            bail!("Wrong password.");
+        }
+        let wait = Duration::from_secs(5 << (self.wrong_tries - FREE_TRIES).min(6));
+        self.retry_at = Some(Instant::now() + wait);
+        bail!(
+            "Wrong password. Wait {} seconds before trying again.",
+            wait.as_secs()
+        )
+    }
+
+    /// The Nym clients' keys, for the network to use and add to. They are
+    /// saved with the profile.
+    pub fn nym_keys(&self) -> NymKeys {
+        self.nym.clone()
+    }
+
+    /// Move the Nym keys that versions before 8 kept in files of their own
+    /// (`slots/`, unencrypted) into the profile, then destroy those files.
+    /// Nothing is deleted unless every key was read and saved.
+    #[cfg(feature = "nym")]
+    pub async fn adopt_nym_files(&mut self) -> Result<()> {
+        let dir = self.profile.slots_dir();
+        if !dir.exists() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&dir).context("list the old Nym key files")? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            if !entry.file_type()?.is_dir() || self.nym.contains(&name) {
+                continue;
+            }
+            let secrets = privmsg_transport::adopt_nym_dir(&entry.path())
+                .await
+                .with_context(|| format!("read the Nym keys in {}", entry.path().display()))?;
+            if let Some(secrets) = secrets {
+                self.nym.set(&name, secrets);
+            }
+        }
+        self.save()?;
+        crate::store::shred_dir(&dir).context("destroy the old Nym key files")?;
+        tracing::info!("moved the Nym keys into the encrypted profile");
+        Ok(())
+    }
+
+    /// Before an erase: tell every contact's app to delete the whole chat
+    /// with us and forget us. Each gets a `Clear` (which older versions
+    /// obey too), then a `Gone`. Messages waiting for a decoy are dropped;
+    /// these go out at once. Returns how many contacts were told; fails
+    /// only if none could be.
+    pub async fn say_goodbye<N: Network>(&mut self, mux: &mut Mux<N>) -> Result<usize> {
+        self.held = None;
+        let names: Vec<String> = self.state.contacts.iter().map(|c| c.name.clone()).collect();
+        let (mut told, mut first_error) = (0, None);
+        for name in &names {
+            let result = async {
+                self.clear_for_everyone(mux, name).await?;
+                let group_id = self.contact(name)?.group_id.clone();
+                self.send_payload(mux, &group_id, &Payload::Gone).await
+            }
+            .await;
+            match result {
+                Ok(_) => told += 1,
+                Err(e) => {
+                    tracing::warn!("could not tell {name}: {e:#}");
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) if told == 0 => Err(e),
+            _ => Ok(told),
+        }
+    }
+
+    /// Destroy this profile for good: see `Profile::erase`. Close the
+    /// network first, so nothing writes to it any more. The node can't be
+    /// used afterwards.
+    pub fn erase(&mut self) -> Result<()> {
+        self.state.wipe();
+        self.nym.clear();
+        self.profile.erase()
     }
 
     pub fn profile_dir(&self) -> &Path {
@@ -646,7 +797,10 @@ impl Node {
     /// The other side is not told.
     pub async fn remove<N: Network>(&mut self, mux: &mut Mux<N>, name: &str) -> Result<()> {
         let slots = if let Ok(idx) = self.index(name) {
-            let contact = self.state.contacts.remove(idx);
+            let mut contact = self.state.contacts.remove(idx);
+            for entry in &mut contact.history {
+                entry.text.zeroize();
+            }
             if let Some(held) = self.held.as_mut() {
                 held.remove(&contact.group_id);
             }
@@ -786,6 +940,10 @@ impl Node {
         if let Some(Event::Timer { .. }) = event {
             self.expire()?;
         }
+        if let Some(Event::Gone { contact }) = &event {
+            self.remove(mux, contact).await?;
+            return Ok(event.into_iter().collect());
+        }
         if ack {
             if let Err(e) = self.send_payload(mux, &group_id, &Payload::RotateAck).await {
                 tracing::warn!("could not confirm an address change: {e:#}");
@@ -900,6 +1058,11 @@ impl Node {
                 Ok((Some(Event::Timer { contact, after }), false))
             }
             Payload::Timer { .. } => bail!("refused an out-of-range disappearing timer"),
+            // The caller removes the contact, with the chat.
+            Payload::Gone => {
+                let contact = contact.name.clone();
+                Ok((Some(Event::Gone { contact }), false))
+            }
             // A repeated Hello carries nothing new; an ack did its work above.
             Payload::Hello { .. } | Payload::RotateAck => Ok((None, false)),
         }
@@ -1047,7 +1210,12 @@ impl Node {
     }
 
     fn save(&mut self) -> Result<()> {
-        self.state.identity = self.identity.snapshot()?;
+        let mut old = std::mem::replace(&mut self.state.identity, self.identity.snapshot()?);
+        old.zeroize();
+        if let Some(nym) = self.nym.take_changes() {
+            let mut old = std::mem::replace(&mut self.state.nym, nym);
+            old.values_mut().for_each(Zeroize::zeroize);
+        }
         self.profile.save(&self.state)
     }
 }
@@ -2007,6 +2175,100 @@ mod tests {
         assert!(bob.node.remove(&mut bob.mux, "nobody").await.is_err());
 
         alice.send("bob", "anyone there?").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn goodbye_deletes_the_chat_on_the_other_side_and_ends_it() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        let mut carol = Peer::new(&net)?;
+        connect(&mut carol, "alice", &mut alice, "carol").await?;
+        alice.send("bob", "a secret").await?;
+        bob.recv().await?;
+        bob.send("alice", "a reply").await?;
+        alice.recv().await?;
+        // Decoys on: the goodbyes still go out at once.
+        alice.node.hold_for_decoys();
+        alice.send("bob", "held back").await?;
+
+        assert_eq!(alice.node.say_goodbye(&mut alice.mux).await?, 2);
+        let bob_slot = bob.current_slot("alice").id;
+        assert_eq!(
+            bob.recv().await?,
+            vec![Event::Cleared {
+                contact: "alice".into()
+            }]
+        );
+        assert_eq!(
+            bob.recv().await?,
+            vec![Event::Gone {
+                contact: "alice".into()
+            }]
+        );
+        assert!(
+            bob.node.contacts().is_empty(),
+            "alice and the chat are gone"
+        );
+        assert!(!bob.mux.is_open(&bob_slot), "and the address for her");
+        assert_eq!(carol.recv().await?.len(), 1);
+        assert!(matches!(carol.recv().await?[..], [Event::Gone { .. }]));
+        assert!(carol.node.contacts().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_gone_from_someone_else_changes_nothing_of_ours() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        let mut carol = Peer::new(&net)?;
+        connect(&mut carol, "alice", &mut alice, "carol").await?;
+        // Carol leaves; only her conversation with Alice ends.
+        carol.node.say_goodbye(&mut carol.mux).await?;
+        alice.recv().await?;
+        alice.recv().await?;
+        assert_eq!(alice.node.contacts().len(), 1);
+        alice.send("bob", "still here").await?;
+        assert_eq!(bob.recv().await?, message("alice", "still here"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wrong_passwords_make_the_next_try_wait() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let mut alice = Peer::new(&net)?;
+        for _ in 0..FREE_TRIES - 1 {
+            let err = alice.node.verify_passphrase("wrong").unwrap_err();
+            assert_eq!(err.to_string(), "Wrong password.");
+        }
+        let err = alice.node.verify_passphrase("wrong").unwrap_err();
+        assert!(err.to_string().contains("Wait 5 seconds"), "{err}");
+        // Even the right one waits now.
+        let err = alice.node.verify_passphrase(PW).unwrap_err();
+        assert!(err.to_string().contains("Try again in"), "{err}");
+        alice.node.retry_at = Some(Instant::now());
+        alice.node.verify_passphrase(PW)?;
+        assert_eq!(alice.node.wrong_tries, 0, "a right one resets the count");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_erased_node_leaves_no_profile() -> Result<()> {
+        let net = MemoryNetwork::default();
+        let (mut alice, mut bob) = connected(&net).await?;
+        alice.send("bob", "hello").await?;
+        bob.recv().await?;
+        let path = alice.path.clone();
+        alice.node.erase()?;
+        assert!(!path.exists());
+        assert!(alice.node.contacts().is_empty(), "wiped in memory too");
+        assert!(alice
+            .node
+            .send_text(&mut alice.mux, "bob", "x")
+            .await
+            .is_err());
+        drop(alice);
+        assert!(Node::open(&path, PW).is_err());
         Ok(())
     }
 }

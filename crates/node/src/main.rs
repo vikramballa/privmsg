@@ -29,7 +29,8 @@ use privmsg_crypto::{Identity, Session};
 use privmsg_node::app::{describe_timer, parse_timer, Event, Node};
 pub(crate) use privmsg_node::clean;
 use privmsg_node::decoy::{self, Scheduler};
-use privmsg_node::store::{HistoryEntry, Profile, Settings, MIN_PASSPHRASE};
+use privmsg_node::secure::harden_process;
+use privmsg_node::store::{FileVault, HistoryEntry, Profile, Settings, MIN_PASSPHRASE};
 use privmsg_transport::{DataMode, Mux, NymNetwork, Tor};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::Instant;
@@ -60,6 +61,8 @@ commands:
   verify <name>           show the safety number to compare with <name>
   rotate <name>           move the conversation with <name> to a new address
   remove <name>           forget a contact or unused invite and its addresses
+  erase                   erase your identity: every message, contact and key on
+                          this device, for good (asks first; /delete in the app)
   address                 show your mix address for each contact
   decoys [on|off|<secs>]  show or set decoy traffic (mean seconds between sends)
   data [saver|balanced|maximum]
@@ -93,6 +96,7 @@ pub(crate) type Network = Mux<NymNetwork>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    harden_process();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let data_dir = take_data_dir(&mut args)?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -115,6 +119,13 @@ async fn main() -> Result<()> {
             .init();
     } else {
         logger.with_writer(std::io::stderr).init();
+    }
+
+    if Profile::erase_pending(&data_dir) {
+        eprintln!("Finishing an erase that was interrupted…");
+        forget_passphrase(&data_dir);
+        Profile::finish_erase(&data_dir, &FileVault)?;
+        eprintln!("Done: that profile is gone.");
     }
 
     match args.as_slice() {
@@ -141,6 +152,7 @@ async fn main() -> Result<()> {
         ["verify", name] => verify(data_dir, name),
         ["rotate", name] => rotate(data_dir, name).await,
         ["remove", name] => remove(data_dir, name).await,
+        ["erase"] => erase(data_dir).await,
         ["decoys"] => decoys(data_dir, None),
         ["decoys", setting] => decoys(data_dir, Some(setting)),
         ["data"] => data_mode(data_dir, None),
@@ -312,7 +324,8 @@ pub(crate) async fn reconnect(node: &mut Node, mux: &mut Network, slots: &[Strin
 }
 
 pub(crate) async fn connect(node: &mut Node, slots: &[String]) -> Result<Network> {
-    let mut net = NymNetwork::new(node.slots_dir(), node.settings().data_mode);
+    node.adopt_nym_files().await?;
+    let mut net = NymNetwork::new(node.nym_keys(), node.settings().data_mode);
     // Even with nothing to open yet: the app opens addresses later (invites).
     if node.settings().tor {
         eprintln!("Starting Tor, so the network can't see your IP address…");
@@ -531,10 +544,115 @@ async fn rotate(dir: PathBuf, name: &str) -> Result<()> {
 async fn remove(dir: PathBuf, name: &str) -> Result<()> {
     let mut node = open(&dir)?;
     // Removing only deletes local keys; nothing needs to be online.
-    let mut mux = Mux::new(NymNetwork::new(node.slots_dir(), node.settings().data_mode));
+    node.adopt_nym_files().await?;
+    let mut mux = Mux::new(NymNetwork::new(node.nym_keys(), node.settings().data_mode));
     node.remove(&mut mux, name).await?;
     println!("{name} removed, with its addresses and conversation keys.");
     Ok(())
+}
+
+/// What erasing destroys and what it can't, said before it happens.
+pub(crate) const ERASE_WARNING: &str = "\
+Erase your identity
+
+This destroys, on this device and for good: every message, every contact,
+your keys and addresses, and the key that could unlock any old copy of
+them. Nothing can bring them back, not even with your password.
+
+It can't reach copies outside this device: what your contacts have (unless
+you let privmsg ask their apps to delete it), screenshots, or a copy of the
+disk someone made earlier.
+
+Deleting data can be against the law when it is evidence, for example
+during a search or under a court order.";
+
+/// How long the goodbyes to contacts may take, connecting included.
+const GOODBYE_TIME: Duration = Duration::from_secs(90);
+
+/// `privmsg erase`: the warning, the word ERASE, whether to tell contacts,
+/// the password, then the erase.
+async fn erase(dir: PathBuf) -> Result<()> {
+    let mut node = open(&dir)?;
+    eprintln!("{ERASE_WARNING}\n");
+    eprint!("Type ERASE (in capitals) to continue, anything else to stop: ");
+    std::io::stderr().flush()?;
+    let mut word = String::new();
+    std::io::stdin().read_line(&mut word)?;
+    if word.trim() != "ERASE" {
+        println!("Stopped. Nothing was erased.");
+        return Ok(());
+    }
+    let tell = !node.contacts().is_empty()
+        && ask("Also ask your contacts' apps to delete your chats and forget you? [Y/n] ")?;
+    let mut tries = 0;
+    loop {
+        let pass = Zeroizing::new(rpassword::prompt_password("Your password: ")?);
+        match node.verify_passphrase(&pass) {
+            Ok(()) => break,
+            Err(e) if tries < 2 => {
+                tries += 1;
+                eprintln!("{e:#}");
+            }
+            Err(e) => {
+                println!("Stopped. Nothing was erased.");
+                return Err(e);
+            }
+        }
+    }
+    let note = if tell {
+        eprintln!(
+            "Telling your contacts (up to {} s)…",
+            GOODBYE_TIME.as_secs()
+        );
+        match tokio::time::timeout(GOODBYE_TIME, connect(&mut node, &[])).await {
+            Ok(Ok(mux)) => goodbye(&mut node, mux).await,
+            Ok(Err(e)) => format!("Could not reach the network to tell your contacts ({e:#})."),
+            Err(_) => "Reaching the network took too long; your contacts were not told.".into(),
+        }
+    } else {
+        String::new()
+    };
+    destroy(node)?;
+    if !note.is_empty() {
+        println!("{note}");
+    }
+    println!("Erased. Your identity is gone from this device.");
+    Ok(())
+}
+
+/// Tell every contact to delete the chat and forget us, then close the
+/// network (flushing what was sent). Says how it went.
+pub(crate) async fn goodbye(node: &mut Node, mut mux: Network) -> String {
+    let telling = async {
+        let told = node.say_goodbye(&mut mux).await;
+        mux.close().await;
+        told
+    };
+    match tokio::time::timeout(GOODBYE_TIME, telling).await {
+        Ok(Ok(1)) => "Asked 1 contact's app to delete your chat.".into(),
+        Ok(Ok(n)) => format!("Asked {n} contacts' apps to delete your chats."),
+        Ok(Err(e)) => format!("Could not tell your contacts ({e:#})."),
+        Err(_) => "Telling your contacts took too long; some may not have heard.".into(),
+    }
+}
+
+/// Erase the profile and forget its remembered password. The network must
+/// be closed already.
+pub(crate) fn destroy(mut node: Node) -> Result<()> {
+    let dir = node.profile_dir().to_path_buf();
+    forget_passphrase(&dir);
+    let erased = node.erase();
+    drop(node);
+    erased
+}
+
+/// Remove the profile's password from the macOS keychain, if it is there.
+fn forget_passphrase(dir: &Path) {
+    if cfg!(target_os = "macos") {
+        if let Err(e) = keychain::delete(dir) {
+            eprintln!("Could not remove the password from your keychain: {e:#}");
+        }
+    }
 }
 
 fn decoys(dir: PathBuf, setting: Option<&str>) -> Result<()> {
@@ -832,6 +950,15 @@ async fn receive(
                     }
                     Event::Cleared { contact } => {
                         println!("* {} cleared the chat, on both sides", clean(&contact))
+                    }
+                    Event::Gone { contact } => {
+                        println!(
+                            "* {} erased their identity; the chat with them is deleted",
+                            clean(&contact)
+                        );
+                        if let Some(s) = scheduler.as_deref_mut() {
+                            s.remove(&contact);
+                        }
                     }
                 }
             }

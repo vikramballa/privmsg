@@ -7,6 +7,7 @@ struct SettingsView: View {
     @State private var settings: SettingsInfo?
     @State private var startedWith: SettingsInfo?
     @State private var error: String?
+    @State private var erasing = false
 
     private static let sleepChoices: [UInt32?] = [nil, 5, 15, 30, 60]
 
@@ -31,7 +32,14 @@ struct SettingsView: View {
                 if let error {
                     Section { Text(error).foregroundStyle(.red) }
                 }
+                Section {
+                    Button("Erase my identity…", role: .destructive) { erasing = true }
+                        .accessibilityIdentifier("erase")
+                } footer: {
+                    Text("Deletes every message, contact and key on this iPhone, for good. It can't be undone.")
+                }
             }
+            .sheet(isPresented: $erasing) { EraseView() }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

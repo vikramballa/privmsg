@@ -49,6 +49,10 @@ windows-sys = { version = "0.59", features = [
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = "1"
+# Mixes the device key into the profile key (already in the tree via OpenMLS).
+hkdf = "0.12"
+# Locking key memory and turning off crash dumps (already in the tree).
+libc = "0.2"
 # Message IDs (already in the tree via OpenMLS).
 sha2 = "0.10"
 
@@ -71,8 +75,12 @@ nym-sdk = "=1.21.6"
 # Used directly only to point Nym at Tor (see crates/transport/src/tor.rs).
 nym-gateway-client = "=1.21.6"
 nym-http-api-client = "=1.21.6"
-# Test-only: check padding against Nym's own packet splitting.
+# The ack key's byte form (the Nym clients' secrets live in the encrypted
+# profile, see crates/transport/src/nym.rs); also checks padding against
+# Nym's own packet splitting in tests.
 nym-sphinx = "=1.21.6"
+# The gateway registration types, to keep them in the profile too.
+nym-client-core-gateways-storage = "=1.21.6"
 rand08 = { package = "rand", version = "=0.8.8" }
 # For Nym's TopologyProvider trait (already in the tree via Nym).
 async-trait = "0.1"

@@ -1,23 +1,37 @@
 //! The real transport: Nym mixnet clients, one per slot plus the sender.
+//!
+//! A Nym client's secrets — its keys, and the key it shares with its
+//! gateway — never touch the disk here. They are kept in [`NymKeys`], which
+//! privmsg stores inside its encrypted profile, so erasing the profile
+//! takes them too. (Earlier versions let the Nym SDK keep them in files of
+//! their own; [`adopt_nym_dir`] reads those once to move them in.)
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
+use nym_client_core_gateways_storage::{
+    GatewayDetails, GatewayPublishedData, RawRegisteredGateway, RawRemoteGatewayDetails,
+};
 use nym_sdk::mixnet::{
-    IncludedSurbs, MixnetClient, MixnetClientBuilder, MixnetMessageSender, NymTopology, Recipient,
-    StoragePaths,
+    ed25519, x25519, ActiveGateway, BadGateway, ClientKeys, EmptyReplyStorage,
+    EphemeralCredentialStorage, GatewayRegistration, GatewaysDetailsStore, IncludedSurbs, KeyStore,
+    MixnetClient, MixnetClientBuilder, MixnetClientStorage, MixnetMessageSender, NymTopology,
+    Recipient, StoragePaths,
 };
 use nym_sdk::{
     DebugConfig, NymApiTopologyProvider, NymApiTopologyProviderConfig, NymNetworkDetails,
     TopologyProvider,
 };
+use nym_sphinx::acknowledgements::AckKey;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
+use zeroize::Zeroize;
 
-use crate::{pad, unpad, DataMode, IncomingMessage, MixAddress, Network, Tor, Transport};
+use crate::{pad, unpad, DataMode, IncomingMessage, MixAddress, Network, NymKeys, Tor, Transport};
 
 /// Gateways a new address tries before giving up.
 const NEW_ADDRESS_TRIES: u32 = 3;
@@ -27,23 +41,23 @@ const NEW_ADDRESS_TRIES: u32 = 3;
 /// hang forever.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Directory of the sender's keys. Slot names are random hex, so they
+/// The sender's name in [`NymKeys`]. Slot names are random hex, so they
 /// can't collide with it.
-const SENDER_DIR: &str = "sender";
+const SENDER: &str = "sender";
 
-/// The Nym mainnet. Each slot keeps its client keys and gateway registration
-/// in its own directory under `root`, so its address survives restarts.
+/// The Nym mainnet. Each slot's client keys and gateway registration are
+/// kept in `keys` under the slot's name, so its address survives restarts.
 pub struct NymNetwork {
-    root: PathBuf,
+    keys: NymKeys,
     mode: DataMode,
     tor: Option<Tor>,
     topology: SharedTopology,
 }
 
 impl NymNetwork {
-    pub fn new(root: PathBuf, mode: DataMode) -> Self {
+    pub fn new(keys: NymKeys, mode: DataMode) -> Self {
         Self {
-            root,
+            keys,
             mode,
             tor: None,
             topology: SharedTopology::default(),
@@ -57,13 +71,6 @@ impl NymNetwork {
         self.tor = Some(tor);
         Ok(self)
     }
-
-    fn dir(&self, slot: &str) -> Result<PathBuf> {
-        if slot.is_empty() || !slot.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err(anyhow!("invalid slot name {slot:?}"));
-        }
-        Ok(self.root.join(slot))
-    }
 }
 
 impl Network for NymNetwork {
@@ -72,28 +79,26 @@ impl Network for NymNetwork {
     /// A new slot registers with a gateway chosen uniformly at random by the
     /// SDK, so two slots of the same user don't share a gateway by design.
     async fn open(&self, slot: &str) -> Result<NymTransport> {
-        self.connect(&self.dir(slot)?, Role::Slot).await
+        if slot.is_empty() || slot == SENDER {
+            return Err(anyhow!("invalid slot name {slot:?}"));
+        }
+        self.connect(slot, Role::Slot).await
     }
 
     async fn open_sender(&self) -> Result<NymTransport> {
-        self.connect(&self.root.join(SENDER_DIR), Role::Sender)
-            .await
+        self.connect(SENDER, Role::Sender).await
     }
 
     fn forget(&self, slot: &str) -> Result<()> {
-        let dir = self.dir(slot)?;
-        match std::fs::remove_dir_all(&dir) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(e).with_context(|| format!("remove {}", dir.display()))
-            }
-            _ => Ok(()),
-        }
+        self.keys.remove(slot);
+        Ok(())
     }
 }
 
 impl NymNetwork {
-    /// Connect to the Nym mainnet, keeping the client's keys and gateway
-    /// registration in `storage_dir` so the overlay address survives restarts.
+    /// Connect to the Nym mainnet as the client `name`, keeping its keys
+    /// and gateway registration in [`NymKeys`] so the overlay address
+    /// survives restarts.
     ///
     /// The sender runs both cover streams at the rates of [`DataMode`].
     /// Never disable the sender's streams — they are the anonymity, not
@@ -109,31 +114,35 @@ impl NymNetwork {
     /// pick. An existing address keeps its gateway, since contacts write to
     /// it, and tries once more after a pause (the Nym API it asks first
     /// sometimes answers 502 through a Tor exit).
-    async fn connect(&self, storage_dir: &Path, role: Role) -> Result<NymTransport> {
-        let fresh = !storage_dir.exists();
+    async fn connect(&self, name: &str, role: Role) -> Result<NymTransport> {
+        let fresh = !self.keys.contains(name);
         let tries = if fresh { NEW_ADDRESS_TRIES } else { 2 };
         let mut attempt = 1;
         loop {
-            match self.connect_once(storage_dir, role).await {
+            match self.connect_once(name, role).await {
                 Err(e) if attempt < tries => {
                     if fresh {
                         tracing::warn!("new address failed ({e:#}); trying another gateway");
-                        std::fs::remove_dir_all(storage_dir).ok();
+                        self.keys.remove(name);
                     } else {
                         tracing::warn!("connecting failed ({e:#}); trying again");
                         sleep(Duration::from_secs(3)).await;
                     }
                     attempt += 1;
                 }
+                Err(e) => {
+                    if fresh {
+                        // Keys no gateway knows are useless; don't keep them.
+                        self.keys.remove(name);
+                    }
+                    return Err(e);
+                }
                 done => return done,
             }
         }
     }
 
-    async fn connect_once(&self, storage_dir: &Path, role: Role) -> Result<NymTransport> {
-        crate::create_private_dir(storage_dir)
-            .with_context(|| format!("create {}", storage_dir.display()))?;
-        let paths = StoragePaths::new_from_dir(storage_dir)?;
+    async fn connect_once(&self, name: &str, role: Role) -> Result<NymTransport> {
         let mut debug = DebugConfig::default();
         match role {
             Role::Sender => {
@@ -149,8 +158,7 @@ impl NymNetwork {
         }
         // No collector is configured anyway; make sure nothing is reported.
         debug.stats_reporting.enabled = false;
-        let connecting = MixnetClientBuilder::new_with_default_storage(paths)
-            .await?
+        let connecting = MixnetClientBuilder::new_with_storage(Kept::storage(name, &self.keys))
             .debug_config(debug)
             .force_tls(self.tor.is_some())
             .custom_topology_provider(Box::new(self.topology.clone()))
@@ -324,6 +332,301 @@ impl Transport for NymTransport {
     }
 }
 
+/// What a Nym client keeps: its own keys (empty until it first connects) and
+/// its gateway registration. Stored in [`NymKeys`] as bincode.
+#[derive(Default, Serialize, Deserialize)]
+struct Secrets {
+    identity: Vec<u8>,
+    encryption: Vec<u8>,
+    ack: Vec<u8>,
+    gateway: Option<(RawRegisteredGateway, RawRemoteGatewayDetails)>,
+}
+
+impl Drop for Secrets {
+    fn drop(&mut self) {
+        self.identity.zeroize();
+        self.encryption.zeroize();
+        self.ack.zeroize();
+        // The gateway's shared key wipes itself (RawRemoteGatewayDetails).
+    }
+}
+
+impl Secrets {
+    fn keys(&self) -> Result<ClientKeys, KeptError> {
+        if self.identity.is_empty() {
+            return Err(KeptError("no keys yet".into()));
+        }
+        let identity = ed25519::PrivateKey::from_bytes(&self.identity)?;
+        let encryption = x25519::PrivateKey::from_bytes(&self.encryption)?;
+        let ack = AckKey::try_from_bytes(&self.ack)?;
+        Ok(ClientKeys::from_keys(
+            identity.into(),
+            encryption.into(),
+            ack,
+        ))
+    }
+
+    fn set_keys(&mut self, keys: &ClientKeys) {
+        self.identity = keys.identity_keypair().private_key().to_bytes().to_vec();
+        self.encryption = keys.encryption_keypair().private_key().to_bytes().to_vec();
+        self.ack = keys.ack_key().to_bytes();
+    }
+
+    fn registration(&self) -> Result<Option<GatewayRegistration>, KeptError> {
+        let Some((registered, details)) = &self.gateway else {
+            return Ok(None);
+        };
+        let details = RawRemoteGatewayDetails {
+            gateway_id_bs58: details.gateway_id_bs58.clone(),
+            derived_aes256_gcm_siv_key: details.derived_aes256_gcm_siv_key.clone(),
+            published_data: details.published_data.clone(),
+        };
+        Ok(Some(GatewayRegistration {
+            details: GatewayDetails::Remote(details.try_into()?),
+            registration_timestamp: registered.registration_timestamp,
+        }))
+    }
+
+    fn set_registration(&mut self, registration: &GatewayRegistration) -> Result<(), KeptError> {
+        let GatewayDetails::Remote(remote) = &registration.details else {
+            return Err(KeptError("only remote gateways are supported".into()));
+        };
+        self.gateway = Some((registration.into(), remote.into()));
+        Ok(())
+    }
+
+    /// The registration, if it is with `gateway_id`.
+    fn registered_with(&self, gateway_id: &str) -> bool {
+        self.gateway
+            .as_ref()
+            .is_some_and(|(r, _)| r.gateway_id_bs58 == gateway_id)
+    }
+}
+
+/// One client's view of [`NymKeys`]: the entry `name`.
+#[derive(Clone)]
+struct Kept {
+    name: String,
+    keys: NymKeys,
+}
+
+impl Kept {
+    /// Everything the Nym SDK needs to keep for the client `name`. Reply
+    /// SURBs and bandwidth credentials are not used, so they are not kept.
+    fn storage(name: &str, keys: &NymKeys) -> KeptStorage {
+        let kept = Kept {
+            name: name.to_string(),
+            keys: keys.clone(),
+        };
+        KeptStorage {
+            keys: kept.clone(),
+            gateways: KeptGateways(kept),
+            replies: EmptyReplyStorage::default(),
+            credentials: EphemeralCredentialStorage::default(),
+        }
+    }
+
+    fn read(&self) -> Result<Secrets, KeptError> {
+        match self.keys.get(&self.name) {
+            None => Ok(Secrets::default()),
+            Some(bytes) => Ok(bincode::deserialize(&bytes)?),
+        }
+    }
+
+    fn write(&self, secrets: &Secrets) -> Result<(), KeptError> {
+        let bytes = bincode::serialize(secrets)?;
+        self.keys.set(&self.name, bytes);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct KeptStorage {
+    keys: Kept,
+    gateways: KeptGateways,
+    replies: EmptyReplyStorage,
+    credentials: EphemeralCredentialStorage,
+}
+
+impl MixnetClientStorage for KeptStorage {
+    type KeyStore = Kept;
+    type ReplyStore = EmptyReplyStorage;
+    type CredentialStore = EphemeralCredentialStorage;
+    type GatewaysDetailsStore = KeptGateways;
+
+    fn into_runtime_stores(
+        self,
+    ) -> (
+        Self::ReplyStore,
+        Self::CredentialStore,
+        Self::GatewaysDetailsStore,
+    ) {
+        (self.replies, self.credentials, self.gateways)
+    }
+
+    fn key_store(&self) -> &Self::KeyStore {
+        &self.keys
+    }
+
+    fn reply_store(&self) -> &Self::ReplyStore {
+        &self.replies
+    }
+
+    fn credential_store(&self) -> &Self::CredentialStore {
+        &self.credentials
+    }
+
+    fn gateway_details_store(&self) -> &Self::GatewaysDetailsStore {
+        &self.gateways
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyStore for Kept {
+    type StorageError = KeptError;
+
+    async fn load_keys(&self) -> Result<ClientKeys, KeptError> {
+        self.read()?.keys()
+    }
+
+    async fn store_keys(&self, keys: &ClientKeys) -> Result<(), KeptError> {
+        let mut secrets = self.read()?;
+        secrets.set_keys(keys);
+        self.write(&secrets)
+    }
+}
+
+/// A client's gateway registration. privmsg's clients only ever register
+/// with one gateway (their address names it), so that one is the active one.
+#[derive(Clone)]
+struct KeptGateways(Kept);
+
+#[async_trait::async_trait]
+impl GatewaysDetailsStore for KeptGateways {
+    type StorageError = KeptError;
+
+    async fn active_gateway(&self) -> Result<ActiveGateway, KeptError> {
+        Ok(ActiveGateway {
+            registration: self.0.read()?.registration()?,
+        })
+    }
+
+    async fn set_active_gateway(&self, gateway_id: &str) -> Result<(), KeptError> {
+        if self.0.read()?.registered_with(gateway_id) {
+            Ok(())
+        } else {
+            Err(KeptError(format!(
+                "not registered with gateway {gateway_id}"
+            )))
+        }
+    }
+
+    async fn all_gateways(&self) -> Result<Vec<GatewayRegistration>, KeptError> {
+        Ok(self.0.read()?.registration()?.into_iter().collect())
+    }
+
+    async fn has_gateway_details(&self, gateway_id: &str) -> Result<bool, KeptError> {
+        Ok(self.0.read()?.registered_with(gateway_id))
+    }
+
+    async fn load_gateway_details(
+        &self,
+        gateway_id: &str,
+    ) -> Result<GatewayRegistration, KeptError> {
+        let secrets = self.0.read()?;
+        match secrets.registration()? {
+            Some(r) if secrets.registered_with(gateway_id) => Ok(r),
+            _ => Err(KeptError(format!(
+                "not registered with gateway {gateway_id}"
+            ))),
+        }
+    }
+
+    async fn store_gateway_details(&self, details: &GatewayRegistration) -> Result<(), KeptError> {
+        let mut secrets = self.0.read()?;
+        secrets.set_registration(details)?;
+        self.0.write(&secrets)
+    }
+
+    async fn update_gateway_published_data(
+        &self,
+        gateway_id: &ed25519::PublicKey,
+        published_data: &GatewayPublishedData,
+    ) -> Result<(), KeptError> {
+        let mut secrets = self.0.read()?;
+        if let Some((_, details)) = secrets
+            .gateway
+            .as_mut()
+            .filter(|(r, _)| r.gateway_id_bs58 == gateway_id.to_base58_string())
+        {
+            details.published_data = published_data.into();
+            self.0.write(&secrets)?;
+        }
+        Ok(())
+    }
+
+    async fn remove_gateway_details(&self, gateway_id: &str) -> Result<(), KeptError> {
+        let mut secrets = self.0.read()?;
+        if secrets.registered_with(gateway_id) {
+            secrets.gateway = None;
+            self.0.write(&secrets)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct KeptError(String);
+
+impl std::fmt::Display for KeptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "kept Nym keys: {}", self.0)
+    }
+}
+
+impl std::error::Error for KeptError {}
+
+/// Errors from Nym's key and gateway types, as a [`KeptError`].
+macro_rules! kept_error_from {
+    ($($error:ty),*) => {$(
+        impl From<$error> for KeptError {
+            fn from(e: $error) -> Self {
+                KeptError(e.to_string())
+            }
+        }
+    )*};
+}
+
+kept_error_from!(
+    BadGateway,
+    bincode::Error,
+    ed25519::Ed25519RecoveryError,
+    x25519::KeyRecoveryError,
+    nym_sphinx::acknowledgements::key::AckKeyConversionError
+);
+
+/// Read the Nym client kept in files in `dir` — how versions before the
+/// keys moved into the profile stored them — as bytes for [`NymKeys`].
+/// `None` if there are no keys there.
+pub async fn adopt_nym_dir(dir: &Path) -> Result<Option<Vec<u8>>> {
+    let paths = StoragePaths::new_from_dir(dir)?;
+    let Ok(keys) = KeyStore::load_keys(&paths.on_disk_key_storage_spec()).await else {
+        return Ok(None);
+    };
+    let mut secrets = Secrets::default();
+    secrets.set_keys(&keys);
+    let gateways = paths
+        .on_disk_gateway_details_storage()
+        .await
+        .context("read the gateway registration")?;
+    if let Some(registration) = gateways.active_gateway().await?.registration {
+        secrets
+            .set_registration(&registration)
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+    Ok(Some(bincode::serialize(&secrets)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,11 +665,40 @@ mod tests {
         assert!("not-an-address".parse::<Recipient>().is_err());
     }
 
+    #[tokio::test]
+    async fn kept_keys_and_registration_round_trip() -> Result<()> {
+        let keys = NymKeys::default();
+        let kept = Kept::storage("ab12", &keys);
+        assert!(kept.key_store().load_keys().await.is_err(), "none yet");
+        assert!(keys.take_changes().is_none());
+
+        let client = ClientKeys::generate_new(&mut rand08::rngs::OsRng);
+        kept.key_store().store_keys(&client).await?;
+        let saved = keys.take_changes().expect("changed");
+        assert!(saved.contains_key("ab12"));
+
+        // A fresh view of the saved bytes gives the same keys back.
+        let again = Kept::storage("ab12", &NymKeys::new(saved));
+        let loaded = again.key_store().load_keys().await?;
+        assert_eq!(
+            loaded.identity_keypair().public_key(),
+            client.identity_keypair().public_key()
+        );
+        assert_eq!(
+            loaded.encryption_keypair().public_key(),
+            client.encryption_keypair().public_key()
+        );
+        assert_eq!(loaded.ack_key().to_bytes(), client.ack_key().to_bytes());
+        let active = again.gateway_details_store().active_gateway().await?;
+        assert!(active.registration.is_none(), "no gateway yet");
+        Ok(())
+    }
+
     #[test]
-    fn nym_slot_names_cannot_escape_the_root() {
-        let net = NymNetwork::new(PathBuf::from("/tmp/root"), DataMode::Saver);
-        assert!(net.dir("../etc").is_err());
-        assert!(net.dir("").is_err());
-        assert_eq!(net.dir("ab12").unwrap(), PathBuf::from("/tmp/root/ab12"));
+    fn the_sender_name_is_not_a_slot() {
+        let net = NymNetwork::new(NymKeys::default(), DataMode::Saver);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(net.open(SENDER)).is_err());
+        assert!(rt.block_on(net.open("")).is_err());
     }
 }

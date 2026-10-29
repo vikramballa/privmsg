@@ -11,7 +11,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+bincode = { workspace = true }
+zeroize = { workspace = true }
 nym-sdk = { workspace = true, optional = true }
+nym-sphinx = { workspace = true, optional = true }
+nym-client-core-gateways-storage = { workspace = true, optional = true }
 nym-gateway-client = { workspace = true, optional = true }
 nym-http-api-client = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
@@ -20,18 +24,15 @@ async-trait = { workspace = true, optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
-[target.'cfg(windows)'.dev-dependencies]
-tempfile = { workspace = true }
-
 [features]
 # The real mixnet. Off only for the fuzz targets, which use the in-memory
 # network and don't need to build (or link) the Nym tree.
 default = ["nym"]
-nym = ["dep:nym-sdk", "dep:nym-gateway-client", "dep:nym-http-api-client", "dep:reqwest", "dep:async-trait"]
+nym = ["dep:nym-sdk", "dep:nym-sphinx", "dep:nym-client-core-gateways-storage", "dep:nym-gateway-client", "dep:nym-http-api-client", "dep:reqwest", "dep:async-trait"]
 # Tor linked in as a library (`Tor::start_embedded`), for the iPhone app,
 # which can't start a tor program. Needs PRIVMSG_TOR_XCFRAMEWORK; see build.rs.
 embedded-tor = ["nym"]
 
 [dev-dependencies]
-nym-sphinx = { workspace = true }
 rand08 = { workspace = true }
+tempfile = { workspace = true }

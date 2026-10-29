@@ -23,10 +23,44 @@ impl Listener for Recorder {
     }
 }
 
+/// A vault like the app's: the device key is sealed with a key that
+/// `destroy` deletes.
+#[derive(Default)]
+struct TestVault {
+    destroyed: Mutex<bool>,
+}
+
+impl KeyVault for TestVault {
+    fn seal(&self, key: Vec<u8>) -> Result<Vec<u8>, MobileError> {
+        self.unseal(key)
+    }
+
+    fn unseal(&self, sealed: Vec<u8>) -> Result<Vec<u8>, MobileError> {
+        if *self.destroyed.lock().unwrap() {
+            return Err(anyhow!("the vault's key is gone").into());
+        }
+        Ok(sealed.iter().map(|b| b ^ 0x5a).collect())
+    }
+
+    fn destroy(&self) -> Result<(), MobileError> {
+        *self.destroyed.lock().unwrap() = true;
+        Ok(())
+    }
+}
+
 fn start(
     dir: &std::path::Path,
     net: &MemoryNetwork,
     create: bool,
+) -> (Arc<Messenger>, Arc<Recorder>) {
+    start_with(dir, net, create, Arc::new(TestVault::default()))
+}
+
+fn start_with(
+    dir: &std::path::Path,
+    net: &MemoryNetwork,
+    create: bool,
+    vault: Arc<TestVault>,
 ) -> (Arc<Messenger>, Arc<Recorder>) {
     let recorder = Arc::new(Recorder::default());
     let net = net.clone();
@@ -34,6 +68,7 @@ fn start(
         dir.to_path_buf(),
         Zeroizing::new("correct horse battery".into()),
         create,
+        Arc::new(AppVault(vault)),
         recorder.clone(),
         move |_, _| {
             move || {
@@ -267,17 +302,76 @@ fn wrong_passphrase_and_short_passphrase_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_string_lossy().to_string();
     let recorder: Arc<dyn Listener> = Arc::new(Recorder::default());
-    let err = Messenger::create(path.clone(), "short".into(), recorder.clone())
-        .err()
-        .unwrap();
+    let vault: Arc<dyn KeyVault> = Arc::new(TestVault::default());
+    let err = Messenger::create(
+        path.clone(),
+        "short".into(),
+        vault.clone(),
+        recorder.clone(),
+    )
+    .err()
+    .unwrap();
     assert!(err.to_string().contains("at least"), "{err}");
-    assert!(!profile_exists(path.clone()));
+    assert!(!profile_exists(path.clone(), vault.clone()));
 
-    drop(Node::create(dir.path(), "correct horse battery").unwrap());
-    let err = Messenger::open(path, "wrong".into(), recorder)
+    let app_vault = Arc::new(AppVault(vault.clone()));
+    drop(Node::create_with(dir.path(), "correct horse battery", app_vault).unwrap());
+    assert!(profile_exists(path.clone(), vault.clone()));
+    let err = Messenger::open(path, "wrong".into(), vault, recorder)
         .err()
         .unwrap();
     assert!(err.to_string().contains("wrong passphrase"), "{err}");
+}
+
+#[tokio::test]
+async fn erasing_tells_the_contact_and_leaves_nothing() {
+    let net = MemoryNetwork::default();
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a_path = a_dir.path().join("profile");
+    let vault = Arc::new(TestVault::default());
+    let (alice, _) = start_with(&a_path, &net, true, vault.clone());
+    let (bob, bob_hears) = start(b_dir.path(), &net, true);
+    until("online", || {
+        alice.status() == ConnectionStatus::Online && bob.status() == ConnectionStatus::Online
+    })
+    .await;
+    let code = bob.create_invite("alice".into()).await.unwrap();
+    alice.accept_invite(code, "bob".into()).await.unwrap();
+    until("the join", || bob.contacts().len() == 1).await;
+    alice.send("bob".into(), "a secret".into()).await.unwrap();
+    until("the message", || bob.messages("alice".into()).len() == 1).await;
+
+    let err = alice
+        .erase_identity("wrong".into(), true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Wrong password"), "{err}");
+    assert_eq!(alice.contacts().len(), 1, "nothing happened");
+
+    let note = alice
+        .erase_identity("correct horse battery".into(), true)
+        .await
+        .unwrap();
+    assert!(note.contains("asked to delete"), "{note}");
+    assert!(
+        *vault.destroyed.lock().unwrap(),
+        "the device key is destroyed"
+    );
+    assert!(!a_path.exists(), "nothing of the profile is left");
+    until("stopped", || alice.status() == ConnectionStatus::Stopped).await;
+    assert!(alice.send("bob".into(), "x".into()).await.is_err());
+
+    until("bob hears", || bob.contacts().is_empty()).await;
+    until("the notice", || {
+        bob_hears
+            .notices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|n| n.contains("erased their identity"))
+    })
+    .await;
+    bob.shutdown().await;
 }
 
 #[test]
@@ -302,6 +396,7 @@ async fn live_sends_several_messages() {
     let phone = Messenger::create(
         dir.path().to_string_lossy().into(),
         "correct horse battery".into(),
+        Arc::new(TestVault::default()),
         recorder.clone(),
     )
     .unwrap();

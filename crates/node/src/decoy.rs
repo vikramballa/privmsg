@@ -46,6 +46,11 @@ impl Scheduler {
         self.next.entry(name).or_insert(at);
     }
 
+    /// Stop the clock of a conversation that has ended.
+    pub fn remove(&mut self, name: &str) {
+        self.next.remove(name);
+    }
+
     /// The conversation whose tick comes first, and when.
     pub fn next_due(&self) -> Option<(String, Instant)> {
         self.next

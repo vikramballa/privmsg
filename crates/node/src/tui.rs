@@ -11,6 +11,11 @@
 //! `/clear` empties the selected chat here, `/clear everyone` on both
 //! sides; `/unsend` deletes your last message in it on both sides.
 //!
+//! `/delete` opens a menu: delete the selected chat here, or on both sides,
+//! or erase your identity. Erasing takes three steps — a warning and the
+//! word ERASE, whether to tell contacts, then the password — and ends the
+//! app with the profile destroyed (`Node::erase`).
+//!
 //! With auto-sleep on, the sender (and its cover traffic) stops after the
 //! set minutes without typing and comes back on the next key press.
 
@@ -30,14 +35,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use tokio::time::Instant;
+use zeroize::Zeroize;
 
 use crate::{
-    clean, connect, far_future, flush_held, reconnect, start_decoys, tick, utc, Network,
-    MAINTENANCE_EVERY,
+    clean, connect, destroy, far_future, flush_held, goodbye, reconnect, start_decoys, tick, utc,
+    Network, ERASE_WARNING, MAINTENANCE_EVERY,
 };
 
 const HELP: &str = "Ctrl-N invite a friend · Ctrl-O enter an invite code · \
-                    Ctrl-D disappearing messages · ↑↓ switch chat · Esc quit";
+                    Ctrl-D disappearing messages · /delete · ↑↓ switch chat · Esc quit";
 
 /// What the input line is for right now.
 #[derive(Default, Clone, PartialEq, Debug)]
@@ -51,6 +57,34 @@ enum Mode {
     Code,
     /// ...and then the name to save its sender under.
     CodeName { code: String },
+    /// `/delete`: waiting for 1, 2 or 3.
+    DeleteMenu,
+    /// Erasing, step 1: the warning is up; the word ERASE goes on.
+    EraseWord,
+    /// Step 2: y or n, tell contacts.
+    EraseTell,
+    /// Step 3: the password, shown as dots.
+    ErasePassword { tell: bool },
+}
+
+impl Mode {
+    /// The `/delete` menu and the erase steps: Esc leaves them at once.
+    fn deleting(&self) -> bool {
+        matches!(
+            self,
+            Mode::DeleteMenu | Mode::EraseWord | Mode::EraseTell | Mode::ErasePassword { .. }
+        )
+    }
+}
+
+/// How the app ended.
+#[derive(Debug, PartialEq)]
+enum Exit {
+    Quit,
+    /// The password was right: erase, telling contacts first or not.
+    Erase {
+        tell: bool,
+    },
 }
 
 #[derive(Default)]
@@ -81,14 +115,48 @@ enum Action {
     Timer,
     /// Enter pressed in the given mode, with the trimmed input.
     Submit(Mode, String),
+    /// A choice in the `/delete` menu.
+    Delete(char),
+    /// The answer to "tell your contacts?".
+    Tell(bool),
 }
 
 impl App {
     fn key(&mut self, code: KeyCode, ctrl: bool) -> Action {
         // Esc or Enter just close a notice; any other key closes it and
         // still counts, so typing straight away loses nothing.
-        if self.notice.take().is_some() && matches!(code, KeyCode::Esc | KeyCode::Enter) {
+        if self.mode.deleting() && code == KeyCode::Esc {
+            self.input.zeroize();
+            self.notice = None;
+            self.mode = Mode::Chat;
+            self.status = "Stopped. Nothing was deleted.".into();
             return Action::None;
+        }
+        // The delete menu and the erase warning stay up while answered.
+        if !self.mode.deleting()
+            && self.notice.take().is_some()
+            && matches!(code, KeyCode::Esc | KeyCode::Enter)
+        {
+            return Action::None;
+        }
+        match (&self.mode, code) {
+            (Mode::DeleteMenu, KeyCode::Char(c @ '1'..='3')) if !ctrl => {
+                self.mode = Mode::Chat;
+                return Action::Delete(c);
+            }
+            (Mode::EraseTell, KeyCode::Char(c @ ('y' | 'Y' | 'n' | 'N'))) if !ctrl => {
+                return Action::Tell(c.eq_ignore_ascii_case(&'y'));
+            }
+            (Mode::DeleteMenu | Mode::EraseTell, KeyCode::Char('c')) if ctrl => {
+                return Action::Quit
+            }
+            (Mode::DeleteMenu | Mode::EraseTell, _) => return Action::None,
+            (Mode::ErasePassword { .. }, KeyCode::Enter) => {
+                // Not trimmed: spaces may be part of the password.
+                let mode = std::mem::take(&mut self.mode);
+                return Action::Submit(mode, std::mem::take(&mut self.input));
+            }
+            _ => {}
         }
         match code {
             KeyCode::Char('c') if ctrl => return Action::Quit,
@@ -153,6 +221,10 @@ impl App {
             (Mode::InviteName, _) => "who are you inviting? (a name only you will see)".into(),
             (Mode::Code, _) => "paste the invite code".into(),
             (Mode::CodeName { .. }, _) => "what do you want to call them?".into(),
+            (Mode::DeleteMenu, _) => "press 1, 2 or 3 · Esc cancels".into(),
+            (Mode::EraseWord, _) => "type ERASE and press Enter · Esc cancels".into(),
+            (Mode::EraseTell, _) => "press y or n · Esc cancels".into(),
+            (Mode::ErasePassword { .. }, _) => "your password · Esc cancels".into(),
         }
     }
 }
@@ -177,9 +249,26 @@ pub async fn run(mut node: Node) -> Result<()> {
     ratatui::restore();
     uncopy(&mut app);
 
+    if let Ok(Exit::Erase { tell }) = result {
+        let note = if tell {
+            eprintln!("Telling your contacts, then erasing…");
+            goodbye(&mut node, mux).await
+        } else {
+            eprintln!("Erasing…");
+            // Dropping the network (and Tor) if it won't close in time.
+            let _ = tokio::time::timeout(Duration::from_secs(10), mux.close()).await;
+            String::new()
+        };
+        destroy(node)?;
+        if !note.is_empty() {
+            println!("{note}");
+        }
+        println!("Erased. Your identity is gone from this device.");
+        return Ok(());
+    }
     flush_held(&mut node, &mut mux).await;
     mux.close().await;
-    result
+    result.map(drop)
 }
 
 async fn event_loop(
@@ -188,7 +277,7 @@ async fn event_loop(
     mux: &mut Network,
     scheduler: &mut Option<Scheduler>,
     app: &mut App,
-) -> Result<()> {
+) -> Result<Exit> {
     let mut keys = EventStream::new();
     let mut maintenance =
         tokio::time::interval_at(Instant::now() + MAINTENANCE_EVERY, MAINTENANCE_EVERY);
@@ -242,6 +331,17 @@ async fn event_loop(
                                 Event::Timer { contact, after } => {
                                     app.status = timer_status(Some(&contact), &contact, after);
                                 }
+                                Event::Gone { contact } => {
+                                    app.status = format!(
+                                        "{} erased their identity; the chat with them is deleted.",
+                                        clean(&contact)
+                                    );
+                                    if let Some(s) = scheduler.as_mut() {
+                                        s.remove(&contact);
+                                    }
+                                    let last = node.contacts().len().saturating_sub(1);
+                                    app.selected = app.selected.min(last);
+                                }
                                 // The chat shows it (a deleted message leaves no trace).
                                 Event::Message { .. }
                                 | Event::Deleted { .. }
@@ -267,9 +367,26 @@ async fn event_loop(
                     }
                     match action {
                         Action::None => {}
-                        Action::Quit => return Ok(()),
+                        Action::Quit => return Ok(Exit::Quit),
                         Action::Move(step) => move_selection(node, app, step),
                         Action::Timer => step_timer(node, mux, app).await,
+                        Action::Delete(choice) => delete(node, mux, app, choice).await,
+                        Action::Tell(tell) => {
+                            app.notice = None;
+                            app.mode = Mode::ErasePassword { tell };
+                            app.status = "Last step: type your password and press Enter.".into();
+                        }
+                        Action::Submit(Mode::ErasePassword { tell }, mut password) => {
+                            let checked = node.verify_passphrase(&password);
+                            password.zeroize();
+                            match checked {
+                                Ok(()) => return Ok(Exit::Erase { tell }),
+                                Err(e) => {
+                                    app.mode = Mode::ErasePassword { tell };
+                                    app.status = format!("{e:#} (Esc cancels)");
+                                }
+                            }
+                        }
                         Action::Submit(mode, line) => {
                             submit(node, mux, scheduler, app, mode, &line).await
                         }
@@ -281,7 +398,7 @@ async fn event_loop(
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(e.into()),
-                None => return Ok(()),
+                None => return Ok(Exit::Quit),
             },
             _ = tokio::time::sleep_until(tick_at), if next_tick.is_some() => {
                 let (name, _) = next_tick.expect("tick scheduled");
@@ -368,6 +485,50 @@ async fn submit(
     let words: Vec<&str> = line.split_whitespace().collect();
     match (mode, words.as_slice()) {
         (Mode::InviteName, _) => invite(node, mux, app, line).await,
+        (Mode::EraseWord, _) if line == "ERASE" => {
+            if node.contacts().is_empty() {
+                app.notice = None;
+                app.mode = Mode::ErasePassword { tell: false };
+                app.status = "Last step: type your password and press Enter.".into();
+            } else {
+                app.mode = Mode::EraseTell;
+                app.notice = Some(
+                    "Erase your identity — step 2 of 3\n\n\
+                     Also ask your contacts' apps to delete your chats with them\n\
+                     (your messages and theirs) and forget you?\n\n\
+                     \x20 y   yes, tell them (they will see that you erased your identity)\n\
+                     \x20 n   no, erase quietly (they keep their copies)"
+                        .into(),
+                );
+                app.status = "Press y or n. Esc cancels.".into();
+            }
+        }
+        (Mode::EraseWord, _) => {
+            app.mode = Mode::EraseWord;
+            app.status = "Type ERASE in capitals to continue, or Esc to stop.".into();
+        }
+        (_, ["/delete"]) => {
+            let chat = selected_name(node, app).map(|name| clean(&name));
+            let (one, two) = match &chat {
+                Some(name) => (
+                    format!("Delete the chat with {name}, only on this device"),
+                    format!("Delete the chat with {name}, for you and for {name}"),
+                ),
+                None => (
+                    "(pick a chat first to delete it)".into(),
+                    "(pick a chat first to delete it)".into(),
+                ),
+            };
+            app.mode = Mode::DeleteMenu;
+            app.notice = Some(format!(
+                "Delete\n\n\
+                 \x20 1   {one}\n\
+                 \x20 2   {two}\n\
+                 \x20 3   Erase my identity: everything on this device, forever\n\n\
+                 Press 1, 2 or 3. Esc cancels."
+            ));
+            app.status = "Press 1, 2 or 3. Esc cancels.".into();
+        }
         (Mode::CodeName { code }, _) => add(node, mux, scheduler, app, &code, line).await,
         (_, ["/invite", name]) => invite(node, mux, app, name).await,
         (_, ["/add", name, code @ ..]) if !code.is_empty() => {
@@ -438,6 +599,34 @@ async fn submit(
                     app.input = line.to_string();
                     app.status = format!("✗ not sent ({e:#}). Press Enter to try again.");
                 }
+            }
+        }
+    }
+}
+
+/// A choice in the `/delete` menu.
+async fn delete(node: &mut Node, mux: &mut Network, app: &mut App, choice: char) {
+    app.notice = None;
+    let chat = selected_name(node, app);
+    match (choice, chat) {
+        ('3', _) => {
+            app.mode = Mode::EraseWord;
+            app.notice = Some(format!(
+                "{ERASE_WARNING}\n\nStep 1 of 3: type ERASE (in capitals) and press Enter. Esc stops."
+            ));
+            app.status = "Type ERASE and press Enter. Esc stops.".into();
+        }
+        (_, None) => app.status = "Pick a conversation first.".into(),
+        ('1', Some(name)) => {
+            app.status = match node.clear_here(&name) {
+                Ok(()) => format!("Chat deleted here. {} still has their copy.", clean(&name)),
+                Err(e) => format!("✗ {e:#}"),
+            }
+        }
+        (_, Some(name)) => {
+            app.status = match node.clear_for_everyone(mux, &name).await {
+                Ok(()) => format!("Chat deleted, here and for {}.", clean(&name)),
+                Err(e) => format!("✗ not deleted: {e:#}"),
             }
         }
     }
@@ -847,11 +1036,14 @@ fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>, aw
     // Long input (an invite code) scrolls: show the end, where the cursor is.
     let width = input_area.width.saturating_sub(3) as usize;
     let typed = app.input.chars().count();
-    let shown: String = app
-        .input
-        .chars()
-        .skip(typed.saturating_sub(width))
-        .collect();
+    let shown: String = if matches!(app.mode, Mode::ErasePassword { .. }) {
+        "•".repeat(typed.min(width))
+    } else {
+        app.input
+            .chars()
+            .skip(typed.saturating_sub(width))
+            .collect()
+    };
     f.render_widget(
         Paragraph::new(shown).block(Block::bordered().title(format!(" {to} "))),
         input_area,
@@ -994,6 +1186,55 @@ mod tests {
         press(&mut app, "hi");
         assert!(app.notice.is_none());
         assert_eq!(app.input, "hi", "the first letter is kept");
+    }
+
+    #[test]
+    fn delete_menu_takes_one_two_or_three() {
+        let mut app = App {
+            mode: Mode::DeleteMenu,
+            ..App::default()
+        };
+        assert_eq!(app.key(KeyCode::Char('x'), false), Action::None);
+        assert_eq!(app.input, "", "nothing typed in the menu");
+        assert_eq!(app.key(KeyCode::Char('3'), false), Action::Delete('3'));
+        assert_eq!(app.mode, Mode::Chat);
+    }
+
+    #[test]
+    fn erasing_asks_tell_then_takes_the_password_untrimmed() {
+        let mut app = App {
+            mode: Mode::EraseTell,
+            ..App::default()
+        };
+        assert_eq!(app.key(KeyCode::Char('q'), false), Action::None);
+        assert_eq!(app.key(KeyCode::Char('n'), false), Action::Tell(false));
+        app.mode = Mode::ErasePassword { tell: false };
+        press(&mut app, " pass word ");
+        assert_eq!(
+            app.key(KeyCode::Enter, false),
+            Action::Submit(Mode::ErasePassword { tell: false }, " pass word ".into())
+        );
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn esc_stops_erasing_at_any_step() {
+        for mode in [
+            Mode::DeleteMenu,
+            Mode::EraseWord,
+            Mode::EraseTell,
+            Mode::ErasePassword { tell: true },
+        ] {
+            let mut app = App {
+                mode,
+                notice: Some("warning".into()),
+                input: "secret".into(),
+                ..App::default()
+            };
+            assert_eq!(app.key(KeyCode::Esc, false), Action::None);
+            assert_eq!(app.mode, Mode::Chat);
+            assert!(app.notice.is_none() && app.input.is_empty());
+        }
     }
 
     #[test]

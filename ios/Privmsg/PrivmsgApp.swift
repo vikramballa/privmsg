@@ -54,6 +54,7 @@ struct RootView: View {
             } else {
                 ChatListView()
             }
+        case .erased(let note): ErasedView(note: note)
         }
     }
 }

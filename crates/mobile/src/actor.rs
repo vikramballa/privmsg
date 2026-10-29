@@ -7,6 +7,10 @@
 //! needs: it never gives up. Tor or the mixnet failing to connect, the
 //! connections dying when the phone changes networks, or the app coming
 //! back after iOS froze it all end in another attempt, not an exit.
+//!
+//! It ends on a shutdown, or on an erase: then it says goodbye to the
+//! contacts (if asked and connected), closes the network and destroys the
+//! profile.
 
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -22,6 +26,7 @@ use privmsg_transport::{Mux, Network};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use crate::view::View;
 use crate::{ConnectionStatus, Listener};
@@ -43,6 +48,9 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The decoy interval used when the app turns decoys on, as the desktop's
 /// `privmsg decoys on` does.
 pub(crate) const DEFAULT_DECOY_INTERVAL: u32 = 10;
+
+/// How long telling contacts may take before an erase goes ahead anyway.
+const GOODBYE_TIME: Duration = Duration::from_secs(60);
 
 type Reply<T> = oneshot::Sender<Result<T>>;
 
@@ -80,6 +88,12 @@ pub(crate) enum Command {
     MarkRead(String),
     SetSettings(Settings, Reply<()>),
     CheckPassphrase(String, oneshot::Sender<bool>),
+    /// Erase the identity, if the passphrase is right.
+    Erase {
+        passphrase: Zeroizing<String>,
+        tell: bool,
+        reply: Reply<String>,
+    },
     /// The app is on screen again after `away` in the background.
     Foreground {
         away: Duration,
@@ -106,6 +120,7 @@ impl Command {
                 | Command::MarkRead(_)
                 | Command::SetSettings(..)
                 | Command::CheckPassphrase(..)
+                | Command::Erase { .. }
                 | Command::Foreground { .. }
                 | Command::Retry
         )
@@ -160,7 +175,15 @@ enum Flow {
     Continue,
     /// Close the connections and make them again.
     Reconnect,
-    Stop(oneshot::Sender<()>),
+    End(Exit),
+}
+
+/// Why the loop ends.
+pub(crate) enum Exit {
+    /// Shut down, telling whoever asked.
+    Stop(Option<oneshot::Sender<()>>),
+    /// Erase: the passphrase was right.
+    Erase { tell: bool, reply: Reply<String> },
 }
 
 /// Run until shut down. `network` makes the network (starting Tor first,
@@ -187,7 +210,9 @@ pub(crate) async fn run<N, F, Fut>(
                 result = &mut making => break result,
                 cmd = commands.recv() => match local(&mut node, cmd, "starting Tor") {
                     ControlFlow::Continue(()) => shared.publish(&node),
-                    ControlFlow::Break(stop) => return finish(stop, &shared),
+                    ControlFlow::Break(exit) => {
+                        return end::<N>(node, None, exit, &shared).await;
+                    }
                 },
             }
         };
@@ -195,17 +220,17 @@ pub(crate) async fn run<N, F, Fut>(
             Ok(net) => break net,
             Err(e) => {
                 tracing::warn!("network did not start: {e:#}");
-                if let ControlFlow::Break(stop) =
+                if let ControlFlow::Break(exit) =
                     wait_to_retry(&mut node, &shared, &mut commands, &e).await
                 {
-                    return finish(stop, &shared);
+                    return end::<N>(node, None, exit, &shared).await;
                 }
             }
         }
     };
 
     let mut mux = Mux::new(net);
-    let stop = 'session: loop {
+    let exit = 'session: loop {
         shared.status(ConnectionStatus::Connecting);
         let slots = node.all_slots();
         let mut deferred = Vec::new();
@@ -219,11 +244,11 @@ pub(crate) async fn run<N, F, Fut>(
                     cmd = commands.recv() => match cmd {
                         // Shutting down doesn't wait for the mixnet.
                         None => {
-                            stopping = Some(None);
+                            stopping = Some(Exit::Stop(None));
                             break None;
                         }
                         Some(Command::Shutdown(stop)) => {
-                            stopping = Some(Some(stop));
+                            stopping = Some(Exit::Stop(Some(stop)));
                             break None;
                         }
                         Some(cmd) if cmd.is_local() => deferred.push(cmd),
@@ -233,11 +258,13 @@ pub(crate) async fn run<N, F, Fut>(
             }
         };
         for cmd in deferred {
-            // Shutdown is never deferred, so this only answers.
-            let _ = local(&mut node, Some(cmd), "connecting");
+            // Shutdown is never deferred; an erase is, and ends the session.
+            if let ControlFlow::Break(exit) = local(&mut node, Some(cmd), "connecting") {
+                stopping.get_or_insert(exit);
+            }
         }
-        if let Some(stop) = stopping {
-            break 'session stop;
+        if let Some(exit) = stopping {
+            break 'session exit;
         }
         match connected {
             Some(Ok(())) => {}
@@ -246,7 +273,7 @@ pub(crate) async fn run<N, F, Fut>(
                 mux.reset(CLOSE_TIMEOUT).await;
                 match wait_to_retry(&mut node, &shared, &mut commands, &e).await {
                     ControlFlow::Continue(()) => continue 'session,
-                    ControlFlow::Break(stop) => break 'session stop,
+                    ControlFlow::Break(exit) => break 'session exit,
                 }
             }
             None => unreachable!("only a shutdown stops connecting early"),
@@ -262,15 +289,53 @@ pub(crate) async fn run<N, F, Fut>(
                 mux.reset(CLOSE_TIMEOUT).await;
                 continue 'session;
             }
-            Flow::Stop(stop) => break 'session Some(stop),
+            Flow::End(exit) => break 'session exit,
         }
     };
+    end(node, Some(mux), exit, &shared).await;
+}
 
-    if let Err(e) = node.send_held(&mut mux).await {
-        tracing::warn!("not everything waiting for a decoy was sent: {e:#}");
-    }
-    mux.close().await;
-    finish(stop, &shared);
+/// Shut down, or erase. `mux` is the network, if it got that far.
+async fn end<N: Network>(mut node: Node, mux: Option<Mux<N>>, exit: Exit, shared: &Shared) {
+    let (tell, reply) = match exit {
+        Exit::Stop(stop) => {
+            if let Some(mut mux) = mux {
+                if let Err(e) = node.send_held(&mut mux).await {
+                    tracing::warn!("not everything waiting for a decoy was sent: {e:#}");
+                }
+                mux.close().await;
+            }
+            return finish(stop, shared);
+        }
+        Exit::Erase { tell, reply } => (tell, reply),
+    };
+    let tell = tell && !node.contacts().is_empty();
+    let note = match mux {
+        Some(mut mux) if tell => {
+            let telling = async {
+                let told = node.say_goodbye(&mut mux).await;
+                // Hands over what was sent before closing.
+                mux.close().await;
+                told
+            };
+            match tokio::time::timeout(GOODBYE_TIME, telling).await {
+                Ok(Ok(1)) => "Your contact was asked to delete your chat.".into(),
+                Ok(Ok(n)) => format!("Your {n} contacts were asked to delete your chats."),
+                Ok(Err(e)) => format!("Your contacts could not be told ({e:#})."),
+                Err(_) => "Telling your contacts took too long; some may not have heard.".into(),
+            }
+        }
+        Some(mux) => {
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, mux.close()).await;
+            String::new()
+        }
+        None if tell => "Not connected, so your contacts were not told.".into(),
+        None => String::new(),
+    };
+    let erased = node.erase().map(|()| note);
+    drop(node);
+    let _ = reply.send(erased);
+    finish(None, shared);
 }
 
 /// Connected: receive and act until the connections need making again, or
@@ -315,8 +380,7 @@ async fn online<N: Network>(
             },
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else {
-                    let (stop, _) = oneshot::channel();
-                    return Flow::Stop(stop);
+                    return Flow::End(Exit::Stop(None));
                 };
                 if !matches!(cmd, Command::MarkRead(_) | Command::Foreground { .. }) {
                     last_active = Instant::now();
@@ -429,10 +493,10 @@ async fn command<N: Network>(
             drop(reply.send(result));
         }
         Command::Foreground { away } if away >= STALE_AFTER => return Flow::Reconnect,
-        Command::Shutdown(stop) => return Flow::Stop(stop),
+        Command::Shutdown(stop) => return Flow::End(Exit::Stop(Some(stop))),
         cmd => {
-            if let ControlFlow::Break(stop) = local(node, Some(cmd), "") {
-                return stop.map_or(Flow::Continue, Flow::Stop);
+            if let ControlFlow::Break(exit) = local(node, Some(cmd), "") {
+                return Flow::End(exit);
             }
         }
     }
@@ -440,14 +504,10 @@ async fn command<N: Network>(
 }
 
 /// Act on a command without the network: answer the local ones, refuse the
-/// rest. `Break` means shut down (with whom to tell, if anyone asked).
-fn local(
-    node: &mut Node,
-    cmd: Option<Command>,
-    why: &str,
-) -> ControlFlow<Option<oneshot::Sender<()>>> {
+/// rest. `Break` means the loop ends: a shutdown, or an erase.
+fn local(node: &mut Node, cmd: Option<Command>, why: &str) -> ControlFlow<Exit> {
     let Some(cmd) = cmd else {
-        return ControlFlow::Break(None);
+        return ControlFlow::Break(Exit::Stop(None));
     };
     match cmd {
         Command::SafetyNumber(name, reply) => drop(reply.send(node.safety_number(&name))),
@@ -474,8 +534,16 @@ fn local(
         Command::CheckPassphrase(passphrase, reply) => {
             let _ = reply.send(node.check_passphrase(&passphrase));
         }
+        Command::Erase {
+            passphrase,
+            tell,
+            reply,
+        } => match node.verify_passphrase(&passphrase) {
+            Ok(()) => return ControlFlow::Break(Exit::Erase { tell, reply }),
+            Err(e) => drop(reply.send(Err(e))),
+        },
         Command::Foreground { .. } | Command::Retry => {}
-        Command::Shutdown(stop) => return ControlFlow::Break(Some(stop)),
+        Command::Shutdown(stop) => return ControlFlow::Break(Exit::Stop(Some(stop))),
         other => other.refuse(why),
     }
     ControlFlow::Continue(())
@@ -488,7 +556,7 @@ async fn wait_to_retry(
     shared: &Shared,
     commands: &mut UnboundedReceiver<Command>,
     error: &anyhow::Error,
-) -> ControlFlow<Option<oneshot::Sender<()>>> {
+) -> ControlFlow<Exit> {
     shared.status(ConnectionStatus::Offline {
         reason: format!("{error:#}"),
         retry_in_secs: RETRY_AFTER.as_secs() as u32,
@@ -500,8 +568,8 @@ async fn wait_to_retry(
             _ = &mut deadline => return ControlFlow::Continue(()),
             cmd = commands.recv() => {
                 let now = matches!(cmd, Some(Command::Retry | Command::Foreground { .. }));
-                if let ControlFlow::Break(stop) = local(node, cmd, "offline") {
-                    return ControlFlow::Break(stop);
+                if let ControlFlow::Break(exit) = local(node, cmd, "offline") {
+                    return ControlFlow::Break(exit);
                 }
                 shared.publish(node);
                 if now {
@@ -538,6 +606,15 @@ fn announce(shared: &Shared, scheduler: &mut Option<Scheduler>, event: Event) {
         }),
         Event::Cleared { contact } => {
             shared.notice(format!("{} cleared the chat.", clean(&contact)))
+        }
+        Event::Gone { contact } => {
+            shared.notice(format!(
+                "{} erased their identity. Your chat with them is deleted.",
+                clean(&contact)
+            ));
+            if let Some(s) = scheduler.as_mut() {
+                s.remove(&contact);
+            }
         }
         // The view shows it; a deleted message leaves no trace.
         Event::Message { .. } | Event::Deleted { .. } => {}

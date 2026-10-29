@@ -42,11 +42,14 @@
 //! [`NymNetwork`] is the real mixnet; [`memory::MemoryNetwork`] is an
 //! in-process stand-in for tests. This is the only crate that touches Nym.
 
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "embedded-tor")]
 mod embedded_tor;
@@ -56,7 +59,7 @@ mod private_dir;
 #[cfg(feature = "nym")]
 mod tor;
 #[cfg(feature = "nym")]
-pub use nym::{NymNetwork, NymTransport};
+pub use nym::{adopt_nym_dir, NymNetwork, NymTransport};
 pub use private_dir::create_private_dir;
 #[cfg(feature = "nym")]
 pub use tor::Tor;
@@ -113,6 +116,77 @@ pub trait Network {
 
     /// Destroy a slot's keys for good. Its address can never receive again.
     fn forget(&self, slot: &str) -> Result<()>;
+}
+
+/// The secrets of every Nym client — its keys and gateway registration — as
+/// opaque bytes, kept in memory for the caller to store (privmsg keeps them
+/// in its encrypted profile, so nothing of them is ever written in the
+/// clear). Clones share the same keys.
+#[derive(Clone, Default)]
+pub struct NymKeys(Arc<Mutex<KeysInner>>);
+
+#[derive(Default)]
+struct KeysInner {
+    clients: BTreeMap<String, Vec<u8>>,
+    changed: bool,
+}
+
+impl Drop for KeysInner {
+    fn drop(&mut self) {
+        self.clients.values_mut().for_each(Zeroize::zeroize);
+    }
+}
+
+impl NymKeys {
+    /// Keys saved earlier, by client name.
+    pub fn new(clients: BTreeMap<String, Vec<u8>>) -> Self {
+        Self(Arc::new(Mutex::new(KeysInner {
+            clients,
+            changed: false,
+        })))
+    }
+
+    fn inner(&self) -> std::sync::MutexGuard<'_, KeysInner> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.inner().clients.contains_key(name)
+    }
+
+    pub fn get(&self, name: &str) -> Option<Zeroizing<Vec<u8>>> {
+        self.inner().clients.get(name).cloned().map(Zeroizing::new)
+    }
+
+    pub fn set(&self, name: &str, secrets: Vec<u8>) {
+        let mut inner = self.inner();
+        if let Some(mut old) = inner.clients.insert(name.to_string(), secrets) {
+            old.zeroize();
+        }
+        inner.changed = true;
+    }
+
+    pub fn remove(&self, name: &str) {
+        let mut inner = self.inner();
+        if let Some(mut old) = inner.clients.remove(name) {
+            old.zeroize();
+            inner.changed = true;
+        }
+    }
+
+    /// Wipe every key (the profile is being erased).
+    pub fn clear(&self) {
+        let mut inner = self.inner();
+        inner.clients.values_mut().for_each(Zeroize::zeroize);
+        inner.clients.clear();
+        inner.changed = false;
+    }
+
+    /// All the keys, if any changed since the last call: what to save.
+    pub fn take_changes(&self) -> Option<BTreeMap<String, Vec<u8>>> {
+        let mut inner = self.inner();
+        std::mem::take(&mut inner.changed).then(|| inner.clients.clone())
+    }
 }
 
 /// Several open slots, received from as one, plus the sender.
