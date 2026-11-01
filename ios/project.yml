@@ -28,8 +28,8 @@ targets:
       path: Privmsg/Info.plist
       properties:
         CFBundleDisplayName: $(APP_DISPLAY_NAME)
-        CFBundleShortVersionString: "0.2.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.3.0"
+        CFBundleVersion: "2"
         UILaunchScreen: {}
         UIApplicationSupportsIndirectInputEvents: true
         UISupportedInterfaceOrientations:

@@ -18,6 +18,7 @@ both:
 - 🧩 **A different address for every contact**, replaced every week, so
   your conversations can't be linked to each other by address.
 - 🧅 **Tor built in**, so not even the Nym servers see your IP address.
+- 📞 **Private voice calls**, without sharing your IP address.
 - 💨 **Disappearing messages** that are deleted on both sides.
 - 📶 **Light on data:** about 9 MB an hour in the default mode, and nothing
   at all while it's closed.
@@ -31,7 +32,7 @@ both:
 ---
 
 ## Contents
-- [What's new in v0.2.0](#whats-new-in-v020)
+- [What's new in v0.3.0](#whats-new-in-v030)
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Quick start](#quick-start)
@@ -47,7 +48,40 @@ both:
 
 ---
 
-## What's new in v0.2.0
+## What's new in v0.3.0
+
+- 📞 **Voice calls**, as private as messages: no IP address is shared and
+  no server learns who calls whom. **Ctrl-T** in the app, or the phone
+  button in a chat on the iPhone. Expect about a second of delay (see
+  [Voice calls](#voice-calls)).
+- 📱 **iPhone app (test version)**, with Tor built in. It talks to the
+  desktop app (see [iPhone](#iphone-test-version)).
+- 🧨 **Erase your identity**: one command (`/delete` → 3 in the app,
+  `privmsg erase`, or **Settings → Erase my identity** on the iPhone)
+  destroys every message, contact and key on the device for good, and can
+  ask your contacts' apps to delete your chats too (see
+  [Erasing your identity](#erasing-your-identity)).
+- 🗑️ **Delete messages and chats**, for you or for everyone (see
+  [Deleting messages and chats](#deleting-messages-and-chats)).
+- 🔐 **Your Nym network keys are now encrypted** inside your profile, with
+  everything else (they used to sit in an unencrypted `slots/` folder).
+- ✅ **More reliable delivery.** Messages no longer get lost when an app
+  closes or reconnects, a dead connection is replaced by itself, and the
+  app reconnects instead of quitting when your internet drops.
+- 🛡️ **Replays are refused**, even after a restart.
+- 🎭 **With decoys on, everything waits for a decoy**, including deletes
+  and timer or address changes, so none of them shows when you're active.
+
+**Updating from v0.2.0:**
+- Messages still work between v0.3.0 and v0.2.0. **Calls need v0.3.0 on
+  both sides**, so ask your contacts to update.
+- Your profile is upgraded automatically, contacts and history included.
+  After that, older versions can't open it any more.
+- Your profile now has a **device key** (`device.key`). Moving or backing
+  up a profile means copying the whole folder; `state.enc` alone can't be
+  opened.
+
+### Earlier: v0.2.0
 
 - **Tor is built in and on by default.** The Nym servers no longer see your
   IP address. The download includes Tor; nothing extra to install.
@@ -57,42 +91,10 @@ both:
   [One sender, many quiet mailboxes](#one-sender-many-quiet-mailboxes)).
 - **Faster messages.** Every short message now fits in a single network
   packet, so it typically arrives in about 3 seconds instead of 7.
-- ### Disappearing messages
-
-Press **Ctrl-D** in a chat. Both sides delete
+- **Disappearing messages.** Press **Ctrl-D** in a chat. Both sides delete
   old messages.
 - **Auto-sleep (optional).** `privmsg sleep 10` pauses the background
   traffic when you're not typing, to save even more data.
-
-⚠️ **Everyone needs v0.2.0.** It can't exchange messages with v0.1.0, so
-ask your contacts to update too. Your existing profile is upgraded
-automatically, contacts and history included.
-
-**Since v0.2.0** (not in the ready-made download yet;
-[build it yourself](#build-it-yourself-mac-and-linux) to get these):
-- **Voice calls**, as private as messages: no IP address is shared and no
-  server learns who calls whom. **Ctrl-T** in the app, or the phone button
-  in a chat on the iPhone. Expect about a second of delay (see
-  [Voice calls](#voice-calls)).
-- **Erase your identity**: one command (`/delete` → 3 in the app,
-  `privmsg erase`, or **Settings → Erase my identity** on the iPhone)
-  destroys every message, contact and key on the device for good, and can
-  ask your contacts' apps to delete your chats too (see
-  [Erasing your identity](#erasing-your-identity)).
-- **Your Nym network keys are now encrypted** inside your profile, with
-  everything else (they used to sit in an unencrypted `slots/` folder).
-- **Delete messages and chats**, for you or for everyone (see
-  [Deleting messages and chats](#deleting-messages-and-chats)).
-- **More reliable delivery.** Messages no longer get lost when an app
-  closes or reconnects, a dead connection is replaced by itself, and the
-  app reconnects instead of quitting when your internet drops.
-- **Replays are refused**, even after a restart.
-- **With decoys on, everything waits for a decoy**, including deletes and
-  timer or address changes, so none of them shows when you're active.
-- Still talks to v0.2.0. Once you open your profile with this version,
-  older versions can't open it any more. It also gets a **device key**
-  (`device.key`): moving or backing up a profile now means copying the
-  whole folder; `state.enc` alone can't be opened.
 
 ---
 
@@ -159,7 +161,7 @@ program it uses to hide your IP address; keep the two together.
 paste (use the folder name you got):
 
 ```bash
-cd ~/Downloads/privmsg-v0.2.0-aarch64-apple-darwin
+cd ~/Downloads/privmsg-v0.3.0-aarch64-apple-darwin
 xattr -dr com.apple.quarantine .
 ./privmsg
 ```
@@ -234,8 +236,14 @@ and put it next to privmsg.
 
 The same messenger as an iPhone app: it talks to the desktop version, and
 Tor and the Nym mixnet run inside the app (no server). It isn't in the App
-Store; you build it on a Mac with Xcode and install it on your own iPhone
-with your Apple ID (free accounts re-install every 7 days):
+Store. Two ways to install it on your own iPhone with your Apple ID (free
+accounts re-install every 7 days):
+
+- **Ready-made:** download `privmsg-v0.3.0-ios-unsigned.ipa` from the
+  [Releases page](https://github.com/vikramballa/privmsg/releases) and
+  install it with [SideStore](https://sidestore.io) or
+  [AltStore](https://altstore.io), which sign it with your Apple ID.
+- **Build it yourself** on a Mac with Xcode:
 
 ```bash
 scripts/build-ios.sh                     # first time: 10–20 minutes
@@ -677,6 +685,9 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
 | Mac: `"tor" can't be opened` or privmsg is "killed" | Run `xattr -dr com.apple.quarantine .` inside the privmsg folder. |
 | Linux: `GLIBC_2.39 not found` (or a similar version) | Your Linux is older than the system the download was built on. [Build it yourself](#build-it-yourself-mac-and-linux) instead; that always works. |
 | Your contact never gets your messages | Check that you both run v0.2.0 or newer. Older versions can't read newer messages. |
+| A call doesn't ring on the other side | You both need v0.3.0 or newer, and the other person's app must be open (calls can't wake a closed app). |
+| The other person can't hear you (Mac) | Allow your terminal app in **System Settings → Privacy & Security → Microphone**, then restart it. The call line shows a warning when the microphone gives only silence. |
+| You can't hear the other person (iPhone) | The sound comes from the earpiece: hold the phone to your ear, or tap **Speaker**. |
 | `Connection lost… Reconnecting…` | Your internet dropped or the Nym gateway went away. privmsg reconnects by itself (5 tries, 20 s apart). |
 | `ignored an incoming message: refused a replayed message` | Someone resent a message you already got. It was blocked; nothing to do. |
 | `… is not a privmsg profile` after going back to an older version | A profile opened by a newer version can't be opened by older ones. Install the newer version again. |

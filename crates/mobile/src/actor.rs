@@ -362,6 +362,9 @@ async fn end<N: Network>(mut node: Node, mux: Option<Mux<N>>, exit: Exit, shared
                 }
                 mux.close().await;
             }
+            // Closed (and its lock let go) before anyone hears it stopped,
+            // so the profile can be opened again at once.
+            drop(node);
             return finish(stop, shared);
         }
         Exit::Erase { tell, reply } => (tell, reply),

@@ -6357,7 +6357,7 @@ dependencies = [
 
 [[package]]
 name = "privmsg-crypto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -6372,7 +6372,7 @@ dependencies = [
 
 [[package]]
 name = "privmsg-mobile"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "privmsg-node",
@@ -6387,7 +6387,7 @@ dependencies = [
 
 [[package]]
 name = "privmsg-node"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6419,7 +6419,7 @@ dependencies = [
 
 [[package]]
 name = "privmsg-transport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
