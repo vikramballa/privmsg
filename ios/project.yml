@@ -41,6 +41,11 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         ITSAppUsesNonExemptEncryption: false
         NSCameraUsageDescription: "To scan a friend's invite code. The picture never leaves your phone."
+        NSMicrophoneUsageDescription: "For calls. Your voice goes only to the person you call, encrypted, over the private network."
+        # Keeps a call going with the screen locked. Nothing runs in the
+        # background otherwise: audio is only on during a call.
+        UIBackgroundModes:
+          - audio
     settings:
       base:
         SWIFT_VERSION: "5.0"

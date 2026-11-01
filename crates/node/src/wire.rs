@@ -5,9 +5,13 @@
 //!   └─ Envelope::Join { welcome, hello }   first contact
 //!      Envelope::Mls(ciphertext)           everything after
 //!         └─ MLS-encrypted Payload::Hello / Text / Rotate / RotateAck / Timer
-//!                                  / Delete / Clear / Gone
+//!                                  / Delete / Clear / Gone / Call
 //!      Envelope::Decoy(random)             cover, discarded on arrival
 //! ```
+//!
+//! A call's audio doesn't travel in any of these: it goes between two
+//! throwaway call lines (see `call`), whose addresses and key ride inside
+//! MLS-encrypted `Payload::Call` messages.
 //!
 //! Nothing identifying travels outside MLS encryption: the joiner's return
 //! address and the invite tag ride inside the encrypted `Hello`, and contact
@@ -126,7 +130,46 @@ pub enum Payload {
     /// the receiver deletes the whole chat and forgets the contact. (Sent
     /// after a `Clear`, which versions that don't know `Gone` still obey.)
     Gone,
+    /// Setting up or ending a voice call.
+    Call(CallSignal),
 }
+
+/// The messages that set up a call. Everything secret about a call — its
+/// key and both call-line addresses — travels only inside these, so only
+/// the two people in the conversation ever learn them.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum CallSignal {
+    /// "I am calling you." `key` encrypts the call's audio; `at` (Unix
+    /// seconds) lets a call that arrives too late to answer show as missed
+    /// instead of ringing.
+    Offer {
+        call: CallId,
+        key: [u8; 32],
+        at: u64,
+    },
+    /// "Send the call's audio here": the sender's call line. From the
+    /// caller as soon as its line is up; from the callee, it means "I
+    /// answered".
+    Line { call: CallId, address: String },
+    /// The call is over, or never started.
+    End { call: CallId, why: CallEnd },
+}
+
+/// Why a call ended.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallEnd {
+    HungUp,
+    Declined,
+    /// Already in another call.
+    Busy,
+    /// Rang without an answer.
+    NoAnswer,
+    /// A call line could not be made.
+    Failed,
+}
+
+/// Names one call, on both sides.
+pub type CallId = [u8; 16];
 
 /// Both sides' name for one message, without sending one: each side hashes
 /// the same MLS ciphertext, the sender after encrypting, the receiver

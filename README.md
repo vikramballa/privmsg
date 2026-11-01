@@ -70,6 +70,10 @@ automatically, contacts and history included.
 
 **Since v0.2.0** (not in the ready-made download yet;
 [build it yourself](#build-it-yourself-mac-and-linux) to get these):
+- **Voice calls**, as private as messages: no IP address is shared and no
+  server learns who calls whom. **Ctrl-T** in the app, or the phone button
+  in a chat on the iPhone. Expect about a second of delay (see
+  [Voice calls](#voice-calls)).
 - **Erase your identity**: one command (`/delete` → 3 in the app,
   `privmsg erase`, or **Settings → Erase my identity** on the iPhone)
   destroys every message, contact and key on the device for good, and can
@@ -178,8 +182,12 @@ Nothing else to install. Space used: about 20 MB for the download, about
 This needs Rust, which takes a few GB of disk space while building. Most
 people should use the download above.
 
+On a Mac, also install cmake (it builds the audio codec for calls):
+`brew install cmake`, or from [cmake.org](https://cmake.org/download/).
+
 On Linux, first install the build tools:
-`sudo apt install -y build-essential git curl xclip` (Debian, Ubuntu, Parrot).
+`sudo apt install -y build-essential git curl xclip cmake libasound2-dev`
+(Debian, Ubuntu, Parrot).
 
 **1. Install Rust** (one time). Open Terminal and run the command shown at
 [rustup.rs](https://rustup.rs), then open a new Terminal window.
@@ -200,7 +208,9 @@ any Terminal window by typing `privmsg`.
 **1. Install Rust** (one time). Download `rustup-init.exe` from
 [rustup.rs](https://rustup.rs), run it, and accept the defaults. When it
 offers to install the Visual Studio build tools, say yes. Also install
-[Git for Windows](https://git-scm.com/download/win).
+[Git for Windows](https://git-scm.com/download/win) and
+[CMake](https://cmake.org/download/) (it builds the audio codec for calls;
+tick "Add CMake to the PATH").
 
 **2. Download and install privmsg.** Open **PowerShell** (Start menu → type
 "PowerShell") and run:
@@ -431,6 +441,62 @@ hold a message, or use **⋯ → Delete chat**.
 - Your contact needs a version with deleting. Older versions ignore it.
 - Messages from before this version can only be deleted on your side.
 
+### Voice calls
+
+In the app, select a contact and press **Ctrl-T** to call. When someone
+calls you, the bottom line says so and the terminal beeps: **Ctrl-Y**
+answers, **Ctrl-T** declines (and hangs up during a call). **Ctrl-U**
+mutes. On the iPhone, tap the phone button at the top of a chat.
+
+What to expect:
+- **About a second of delay**, like a satellite phone: measured 1.0–1.2
+  seconds from mouth to ear on calls over the real network, steady for
+  the whole call. You'll sometimes start talking at the same time; leave
+  a short pause. The private route (Tor, then the Nym mixnet, then Tor
+  again) costs that time; no app that hides IP addresses does much
+  better.
+- **10–30 seconds to connect** after the other person answers: each side
+  sets up a private line for the call.
+- **About 0.2 GB of internet data per hour of call** for each person. Wi-Fi
+  is best for long calls.
+- **With decoys on**, ringing and answering wait for decoy slots like any
+  message, so calls take longer to connect.
+- **Both people need the app open** (calls can't wake a closed app: that
+  would need Apple's or Google's push servers), and both need this version.
+- **Headphones sound best.** The app cancels echo, but a laptop speaker
+  next to its own microphone is hard.
+- **The call looks after its own connection.** If it drops (a phone
+  changing networks, say), or a server on the way starts losing much of
+  the audio, the call moves to a fresh private line by itself, usually
+  within about 30 seconds. After a network hiccup the delay comes back
+  down within a few seconds instead of building up.
+- **On the iPhone** the sound comes from the earpiece, like a phone call:
+  hold it to your ear, or tap **Speaker**.
+- **On a Mac**, the first call asks to use the microphone for your
+  terminal app. If the other person hears nothing, the call line says the
+  microphone gives only silence: turn your terminal app on in **System
+  Settings → Privacy & Security → Microphone**, then restart it.
+- Calls show in the chat ("Call · 3:12", "Missed call") on your device
+  only. The iPhone app doesn't use Apple's call screen (CallKit), which
+  would put your calls in the phone's call history and iCloud.
+
+How it stays private:
+- The call is set up inside your encrypted conversation. Its key and the
+  addresses the audio goes between travel only in there.
+- The audio doesn't use your normal addresses: each side makes a
+  throwaway Nym address for this call alone, deleted afterwards.
+- Every packet has the same size and goes out at the same pace (ten a
+  second) from before the other person answers until a few random
+  seconds after the call, whether anyone is talking or not. Speech
+  doesn't change what anyone on the network sees.
+- The microphone is on only while you're talking to someone.
+
+What a call can't hide: the steady stream shows **that** you are on a
+call and for how long to someone watching your internet connection (they
+still can't tell with whom, or what is said). Someone able to watch both
+people's connections and the Nym network at once may be able to match the
+two ends of a call.
+
 ### Erasing your identity
 
 A kill switch for everything privmsg has on the device. In the app, type
@@ -558,8 +624,14 @@ Where Tor itself is blocked (for example China, Iran or Russia), it needs
   (unless you turn on auto-sleep); with decoys on, real messages are also
   hidden among decoys at your contact's end.
 - **Old messages:** with disappearing messages on, both sides delete them.
+- **Calls:** what is said, who you call, and your IP address, as for
+  messages (see [Voice calls](#voice-calls)).
 
 **Not protected ⚠️**
+- **That you're on a call:** a call is a steady stream of data, so someone
+  watching your connection can see when you're on one and for how long.
+  Someone watching both callers' connections and the mixnet at once may be
+  able to tell that you are calling each other.
 - **Gateways working together (with Tor off):** all your addresses then
   connect from the same IP address, so gateway operators who pooled their
   logs could link them. With Tor on, each address arrives through its own

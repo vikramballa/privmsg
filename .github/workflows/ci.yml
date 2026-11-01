@@ -24,6 +24,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # rustup picks up rust-toolchain.toml (pinned compiler + clippy/rustfmt).
       - run: rustup show active-toolchain
+      # Calls use the sound card through ALSA on Linux.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        if: runner.os == 'Linux'
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       # --locked: never let CI re-resolve the pinned Nym tree.

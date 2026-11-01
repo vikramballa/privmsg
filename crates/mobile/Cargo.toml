@@ -25,7 +25,7 @@ embedded-tor = ["privmsg-transport/embedded-tor"]
 bindgen = ["uniffi/cli"]
 
 [dependencies]
-privmsg-node = { path = "../node" }
+privmsg-node = { path = "../node", default-features = false, features = ["nym"] }
 privmsg-transport = { path = "../transport" }
 anyhow = { workspace = true }
 tokio = { workspace = true }

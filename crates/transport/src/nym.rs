@@ -45,6 +45,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 /// can't collide with it.
 const SENDER: &str = "sender";
 
+/// How long a call line may take to reach a gateway before another is
+/// tried. Through Tor it usually takes 8–25 s; waiting the full
+/// [`CONNECT_TIMEOUT`] would leave someone listening to ringing for minutes.
+const CALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Gateways a call line tries before the call fails.
+const CALL_TRIES: u32 = 3;
+
+/// Mean gap of a call line's loop cover. The line's own steady stream is
+/// what hides the call; this only keeps the gateway connection alive.
+const CALL_LOOP: Duration = Duration::from_secs(5);
+
 /// The Nym mainnet. Each slot's client keys and gateway registration are
 /// kept in `keys` under the slot's name, so its address survives restarts.
 pub struct NymNetwork {
@@ -93,6 +105,67 @@ impl Network for NymNetwork {
         self.keys.remove(slot);
         Ok(())
     }
+
+    /// A fresh Nym client with keys that are never stored. It sends each
+    /// packet the moment it is handed one, instead of on Nym's random
+    /// (Poisson) clock: the call paces it at a constant rate, which hides
+    /// the speech as well and costs a third of the data, since no cover
+    /// packets have to fill the clock's spare slots. Lost packets are not
+    /// sent again: audio that comes late is useless, and a resend would
+    /// break the constant rate.
+    fn open_call(
+        &self,
+    ) -> impl std::future::Future<Output = Result<NymTransport>> + Send + 'static + use<> {
+        let topology = self.topology.clone();
+        let over_tor = self.tor.is_some();
+        let mode = self.mode;
+        async move {
+            let mut attempt = 1;
+            loop {
+                match connect_call(topology.clone(), over_tor, mode).await {
+                    Err(e) if attempt < CALL_TRIES => {
+                        tracing::warn!("call line failed ({e:#}); trying another gateway");
+                        attempt += 1;
+                    }
+                    done => return done,
+                }
+            }
+        }
+    }
+}
+
+/// One attempt at a call line (see [`NymNetwork::open_call`]).
+async fn connect_call(
+    topology: SharedTopology,
+    over_tor: bool,
+    mode: DataMode,
+) -> Result<NymTransport> {
+    let mut debug = DebugConfig::default();
+    debug.traffic.disable_main_poisson_packet_distribution = true;
+    debug.traffic.maximum_number_of_retransmissions = Some(0);
+    debug.cover_traffic.loop_cover_traffic_average_delay = CALL_LOOP;
+    debug.stats_reporting.enabled = false;
+    let connecting = MixnetClientBuilder::new_ephemeral()
+        .debug_config(debug)
+        .force_tls(over_tor)
+        .custom_topology_provider(Box::new(topology))
+        .build()?
+        .connect_to_mixnet();
+    let client = tokio::time::timeout(CALL_CONNECT_TIMEOUT, connecting)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "the gateway did not answer within {} s",
+                CALL_CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+        .context("connect a call line to the Nym mixnet")?;
+    Ok(NymTransport {
+        client,
+        mode,
+        last_send: None,
+        call: true,
+    })
 }
 
 impl NymNetwork {
@@ -177,6 +250,7 @@ impl NymNetwork {
             client,
             mode: self.mode,
             last_send: None,
+            call: false,
         })
     }
 }
@@ -244,6 +318,8 @@ pub struct NymTransport {
     client: MixnetClient,
     mode: DataMode,
     last_send: Option<Instant>,
+    /// A call line: nothing it sends is worth waiting for once it closes.
+    call: bool,
 }
 
 impl NymTransport {
@@ -269,9 +345,10 @@ impl NymTransport {
 
     /// Flush pending sends, if anything was sent, then close the
     /// connection to the gateway. A slot (which never sends) closes at
-    /// once, so it stops taking in messages nothing will read.
+    /// once, so it stops taking in messages nothing will read, and so does
+    /// a call line, whose audio would be too late anyway.
     pub async fn disconnect(self) {
-        if self.last_send.is_some() {
+        if self.last_send.is_some() && !self.call {
             self.flush(Duration::from_secs(30)).await;
         }
         self.client.disconnect().await;

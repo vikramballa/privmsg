@@ -1,3 +1,4 @@
+import AudioToolbox
 import Foundation
 import Observation
 import UIKit
@@ -28,6 +29,11 @@ final class AppModel {
     var notice: String?
     /// The app's own lock screen is up (after leaving the app, if that's on).
     var screenLocked = false
+    /// The call, if there is one.
+    private(set) var call: CallView?
+    /// When the talking started, for the call's clock.
+    private(set) var talkingSince: Date?
+    private(set) var onSpeaker = false
 
     private(set) var messenger: Messenger?
     private let profileDirectory = Storage.profileDirectory()
@@ -36,6 +42,8 @@ final class AppModel {
     private var backgroundSince: Date?
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var noticeTask: Task<Void, Never>?
+    private var audio: CallAudio?
+    private var ringer: Task<Void, Never>?
 
     /// Ask for the passphrase again after leaving the app.
     var lockOnLeave: Bool {
@@ -80,6 +88,46 @@ final class AppModel {
 
     fileprivate func statusChanged(_ status: ConnectionStatus) {
         self.status = status
+    }
+
+    fileprivate func callChanged(_ call: CallView?) {
+        let was = self.call?.stage
+        self.call = call
+        if call?.stage == .ringing && was != .ringing {
+            ring()
+        } else if call?.stage != .ringing {
+            ringer?.cancel()
+            ringer = nil
+        }
+        if call?.stage == .talking && audio == nil, let messenger {
+            talkingSince = Date().addingTimeInterval(-Double(call?.talkingSecs ?? 0))
+            let audio = CallAudio(messenger: messenger)
+            do {
+                try audio.start()
+                audio.useSpeaker(onSpeaker)
+                self.audio = audio
+            } catch {
+                show("The microphone or speaker didn't start: \(error.localizedDescription)")
+            }
+        } else if call == nil {
+            audio?.stop()
+            audio = nil
+            talkingSince = nil
+            onSpeaker = false
+        }
+    }
+
+    /// Vibrate and chime every few seconds while a call rings. (No CallKit:
+    /// it would put calls in the phone's history, which iCloud syncs.)
+    private func ring() {
+        ringer?.cancel()
+        ringer = Task {
+            while !Task.isCancelled {
+                AudioServicesPlayAlertSound(SystemSoundID(kSystemSoundID_Vibrate))
+                AudioServicesPlaySystemSound(SystemSoundID(1005))
+                try? await Task.sleep(for: .seconds(3))
+            }
+        }
     }
 
     fileprivate func refresh() {
@@ -207,6 +255,48 @@ final class AppModel {
     func retry() {
         messenger?.retry()
     }
+
+    // MARK: Calls
+
+    func startCall(_ name: String) async {
+        guard await CallAudio.askForMicrophone() else {
+            show("privmsg needs the microphone for calls. Allow it in Settings › Privacy › Microphone.")
+            return
+        }
+        do {
+            try await messenger?.startCall(name: name)
+            call = messenger?.call()
+        } catch {
+            show("\(error)")
+        }
+    }
+
+    func answerCall() async {
+        guard await CallAudio.askForMicrophone() else {
+            show("privmsg needs the microphone for calls. Allow it in Settings › Privacy › Microphone.")
+            await endCall()
+            return
+        }
+        do {
+            try await messenger?.answerCall()
+        } catch {
+            show("\(error)")
+        }
+    }
+
+    func endCall() async {
+        try? await messenger?.endCall()
+    }
+
+    func toggleMute() {
+        guard let call else { return }
+        messenger?.setMuted(muted: !call.muted)
+    }
+
+    func toggleSpeaker() {
+        onSpeaker.toggle()
+        audio?.useSpeaker(onSpeaker)
+    }
 }
 
 /// Receives the messenger's calls (on its threads) and hands them to the
@@ -228,5 +318,9 @@ private final class ListenerBridge: Listener, @unchecked Sendable {
 
     func notice(text: String) {
         Task { @MainActor [weak self] in self?.model?.show(text) }
+    }
+
+    func call(call: CallView?) {
+        Task { @MainActor [weak self] in self?.model?.callChanged(call) }
     }
 }

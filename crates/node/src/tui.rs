@@ -18,6 +18,10 @@
 //!
 //! With auto-sleep on, the sender (and its cover traffic) stops after the
 //! set minutes without typing and comes back on the next key press.
+//!
+//! Calls: Ctrl-T calls the selected contact (and hangs up, or declines a
+//! call that rings); Ctrl-Y answers; Ctrl-U mutes. The bottom line shows
+//! the call. The microphone and speaker are open only while talking.
 
 use std::time::Duration;
 
@@ -28,6 +32,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use privmsg_node::app::{describe_timer, next_timer, parse_timer, Event, Node};
+use privmsg_node::call::{AudioPipe, CallInfo, CallState, CallUpdate, Calls};
 use privmsg_node::decoy::Scheduler;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
@@ -37,13 +42,17 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::time::Instant;
 use zeroize::Zeroize;
 
+use crate::audio::{echo_canceller, Devices};
 use crate::{
     clean, connect, destroy, far_future, flush_held, goodbye, reconnect, start_decoys, tick, utc,
     Network, ERASE_WARNING, MAINTENANCE_EVERY,
 };
 
-const HELP: &str = "Ctrl-N invite a friend · Ctrl-O enter an invite code · \
+const HELP: &str = "Ctrl-N invite a friend · Ctrl-O enter an invite code · Ctrl-T call · \
                     Ctrl-D disappearing messages · /delete · ↑↓ switch chat · Esc quit";
+
+/// How often a ringing call beeps.
+const RING_EVERY: Duration = Duration::from_secs(3);
 
 /// What the input line is for right now.
 #[derive(Default, Clone, PartialEq, Debug)]
@@ -99,6 +108,10 @@ struct App {
     notice: Option<String>,
     /// An invite code we put on the clipboard, and when to take it off.
     copied: Option<(String, Instant)>,
+    /// The call, if there is one, as last seen.
+    call: Option<CallInfo>,
+    /// Something wrong with the call's sound, shown on the call's line.
+    call_problem: Option<String>,
 }
 
 /// How long an invite code stays on the clipboard if it isn't used.
@@ -119,6 +132,12 @@ enum Action {
     Delete(char),
     /// The answer to "tell your contacts?".
     Tell(bool),
+    /// Ctrl-T: call the selected contact, or end the call.
+    Call,
+    /// Ctrl-Y: answer.
+    Answer,
+    /// Ctrl-U: mute or unmute.
+    Mute,
 }
 
 impl App {
@@ -178,6 +197,9 @@ impl App {
                     "Paste the invite code you were sent, then press Enter. Esc cancels.".into();
             }
             KeyCode::Char('d') if ctrl && self.mode == Mode::Chat => return Action::Timer,
+            KeyCode::Char('t') if ctrl => return Action::Call,
+            KeyCode::Char('y') if ctrl => return Action::Answer,
+            KeyCode::Char('u') if ctrl => return Action::Mute,
             KeyCode::Up if self.mode == Mode::Chat => return Action::Move(-1),
             KeyCode::Down | KeyCode::Tab if self.mode == Mode::Chat => return Action::Move(1),
             KeyCode::Backspace => {
@@ -244,10 +266,25 @@ pub async fn run(mut node: Node) -> Result<()> {
         status: HELP.into(),
         ..App::default()
     };
-    let result = event_loop(&mut terminal, &mut node, &mut mux, &mut scheduler, &mut app).await;
+    let mut phone = Phone {
+        calls: Calls::new(AudioPipe::default(), Some(echo_canceller())),
+        devices: None,
+    };
+    let result = event_loop(
+        &mut terminal,
+        &mut node,
+        &mut mux,
+        &mut scheduler,
+        &mut app,
+        &mut phone,
+    )
+    .await;
     crossterm::execute!(std::io::stdout(), DisableBracketedPaste).ok();
     ratatui::restore();
     uncopy(&mut app);
+    // Leaving ends a call, telling the other side.
+    phone.devices = None;
+    phone.calls.hang_up(&mut node, &mut mux).await;
 
     if let Ok(Exit::Erase { tell }) = result {
         let note = if tell {
@@ -271,30 +308,120 @@ pub async fn run(mut node: Node) -> Result<()> {
     result.map(drop)
 }
 
+/// The call, and the microphone and speaker while talking.
+struct Phone {
+    calls: Calls,
+    devices: Option<Devices>,
+}
+
+impl Phone {
+    /// Show (and act on) what a call did.
+    fn update(&mut self, app: &mut App, update: Option<CallUpdate>) {
+        let Some(update) = update else { return };
+        match update {
+            CallUpdate::Ringing { .. } => ring(),
+            CallUpdate::Talking { contact } => match Devices::open(self.calls.audio()) {
+                Ok(devices) => {
+                    self.devices = Some(devices);
+                    app.call_problem = None;
+                    app.status = format!("Connected with {}.", clean(&contact));
+                }
+                Err(e) => {
+                    app.call_problem =
+                        Some(format!("✗ the microphone or speaker didn't start: {e:#}"))
+                }
+            },
+            CallUpdate::Ended { contact, note } => {
+                self.devices = None;
+                app.call_problem = None;
+                app.status = if note.is_empty() {
+                    "The call ended.".into()
+                } else {
+                    format!("{} with {}.", note, clean(&contact))
+                };
+            }
+            CallUpdate::Reconnecting { .. } => {
+                app.status = "The connection dropped; reconnecting the call…".into()
+            }
+            CallUpdate::Missed { contact } => {
+                app.status = format!("Missed call from {}.", clean(&contact))
+            }
+        }
+    }
+
+    /// A few seconds into the talking, check that the microphone gives
+    /// sound: a Mac hands an app it may not use pure silence, without an
+    /// error.
+    fn check_microphone(&self, app: &mut App) {
+        let Some(call) = &app.call else { return };
+        if call.state != CallState::Talking
+            || call.muted
+            || self.devices.is_none()
+            || call.talking < Duration::from_secs(3)
+        {
+            return;
+        }
+        let stats = self.calls.audio().stats();
+        let problem = if stats.mic_heard == 0 {
+            Some("✗ no sound comes from the microphone".to_string())
+        } else if stats.mic_loudest == 0.0 {
+            Some(MIC_BLOCKED.to_string())
+        } else {
+            None
+        };
+        if problem.is_some() || app.call_problem.as_deref() == Some(MIC_BLOCKED) {
+            app.call_problem = problem;
+        }
+    }
+}
+
+const MIC_BLOCKED: &str = "✗ the microphone gives only silence: allow your terminal app in \
+                           System Settings › Privacy & Security › Microphone, then restart it";
+
+/// The terminal's bell, for a ringing call.
+fn ring() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
 async fn event_loop(
     terminal: &mut DefaultTerminal,
     node: &mut Node,
     mux: &mut Network,
     scheduler: &mut Option<Scheduler>,
     app: &mut App,
+    phone: &mut Phone,
 ) -> Result<Exit> {
     let mut keys = EventStream::new();
     let mut maintenance =
         tokio::time::interval_at(Instant::now() + MAINTENANCE_EVERY, MAINTENANCE_EVERY);
     let mut last_typed = Instant::now();
+    // While in a call: redraw each second (the call's clock), and beep
+    // while it rings.
+    let mut second = tokio::time::interval(Duration::from_secs(1));
+    let mut bell = tokio::time::interval(RING_EVERY);
     loop {
         if let Some(name) = selected_name(node, app) {
             node.mark_read(&name)?;
         }
+        app.call = phone.calls.info();
         terminal.draw(|f| draw(f, node, app, scheduler.as_ref(), mux.is_awake()))?;
+        let ringing = app
+            .call
+            .as_ref()
+            .is_some_and(|c| c.state == CallState::Ringing);
+        let ring_until = phone.calls.deadline();
 
         let next_tick = scheduler.as_ref().and_then(Scheduler::next_due);
         let tick_at = next_tick.as_ref().map_or_else(far_future, |(_, at)| *at);
-        // Decoys keep sending by design, so they keep the sender up.
+        // Decoys keep sending by design, so they keep the sender up; so
+        // does a call, which may need to say it ended.
         let idle_limit = node
             .settings()
             .auto_sleep
-            .filter(|_| scheduler.is_none())
+            .filter(|_| scheduler.is_none() && !phone.calls.is_busy())
             .map(|mins| Duration::from_secs(u64::from(mins) * 60));
         let sleep_at = idle_limit.map_or_else(far_future, |limit| last_typed + limit);
         let uncopy_at = app.copied.as_ref().map_or_else(far_future, |(_, at)| *at);
@@ -331,7 +458,20 @@ async fn event_loop(
                                 Event::Timer { contact, after } => {
                                     app.status = timer_status(Some(&contact), &contact, after);
                                 }
+                                Event::Call { contact, signal } => {
+                                    let update =
+                                        phone.calls.on_signal(node, mux, &contact, signal).await;
+                                    if matches!(update, Some(CallUpdate::Ringing { .. }))
+                                        && app.mode == Mode::Chat
+                                    {
+                                        app.notice = None;
+                                        select(node, app, &contact);
+                                    }
+                                    phone.update(app, update);
+                                }
                                 Event::Gone { contact } => {
+                                    let update = phone.calls.forget(node, &contact);
+                                    phone.update(app, update);
                                     app.status = format!(
                                         "{} erased their identity; the chat with them is deleted.",
                                         clean(&contact)
@@ -370,6 +510,37 @@ async fn event_loop(
                         Action::Quit => return Ok(Exit::Quit),
                         Action::Move(step) => move_selection(node, app, step),
                         Action::Timer => step_timer(node, mux, app).await,
+                        Action::Call if phone.calls.is_busy() => {
+                            let update = phone.calls.hang_up(node, mux).await;
+                            phone.update(app, update);
+                        }
+                        Action::Call => match selected_name(node, app) {
+                            Some(name) => {
+                                app.status = format!("Calling {}…", clean(&name));
+                                terminal.draw(|f| draw(f, node, app, scheduler.as_ref(), mux.is_awake()))?;
+                                app.status = match phone.calls.start(node, mux, &name).await {
+                                    Ok(()) => format!(
+                                        "Calling {}. A private line takes 10–30 seconds to set up.",
+                                        clean(&name)
+                                    ),
+                                    Err(e) => format!("✗ {e:#}"),
+                                };
+                            }
+                            None => app.status = "Pick someone to call first.".into(),
+                        },
+                        Action::Answer => {
+                            app.status = match phone.calls.accept(mux) {
+                                Ok(()) => "Answered. Setting up a private line (10–30 seconds)…".into(),
+                                Err(e) => format!("{e:#}"),
+                            }
+                        }
+                        Action::Mute => match &app.call {
+                            Some(call) => {
+                                phone.calls.set_muted(!call.muted);
+                                app.status = if call.muted { "Unmuted." } else { "Muted." }.into();
+                            }
+                            None => app.status = "Not in a call.".into(),
+                        },
                         Action::Delete(choice) => delete(node, mux, app, choice).await,
                         Action::Tell(tell) => {
                             app.notice = None;
@@ -411,6 +582,16 @@ async fn event_loop(
                 }
             }
             _ = tokio::time::sleep_until(uncopy_at), if app.copied.is_some() => uncopy(app),
+            news = phone.calls.next() => {
+                let update = phone.calls.on_news(node, mux, news).await;
+                phone.update(app, update);
+            }
+            _ = tokio::time::sleep_until(ring_until.unwrap_or_else(far_future)), if ring_until.is_some() => {
+                let update = phone.calls.check(node, mux).await;
+                phone.update(app, update);
+            }
+            _ = second.tick(), if app.call.is_some() => phone.check_microphone(app),
+            _ = bell.tick(), if ringing => ring(),
             _ = tokio::time::sleep_until(sleep_at), if idle_limit.is_some() && mux.is_awake() => {
                 mux.sleep().await;
                 app.status =
@@ -1053,7 +1234,11 @@ fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>, aw
         input_area.y + 1,
     ));
 
-    let mut status = clean(&app.status);
+    let mut status = match (&app.call, &app.call_problem) {
+        (Some(call), Some(problem)) => format!("{} · {}", call_line(call), clean(problem)),
+        (Some(call), None) => call_line(call),
+        (None, _) => clean(&app.status),
+    };
     if scheduler.is_some() {
         status = format!("[decoys on, {} queued] {status}", node.queued());
     }
@@ -1070,8 +1255,37 @@ fn draw(f: &mut Frame, node: &Node, app: &App, scheduler: Option<&Scheduler>, aw
         Constraint::Length(network.len() as u16),
     ])
     .areas(status_area);
-    f.render_widget(Paragraph::new(status).dim(), status_area);
+    let status = Paragraph::new(status);
+    f.render_widget(
+        if app.call.is_some() {
+            status.bold()
+        } else {
+            status.dim()
+        },
+        status_area,
+    );
     f.render_widget(Paragraph::new(network).dim().reversed(), network_area);
+}
+
+/// The bottom line during a call.
+fn call_line(call: &CallInfo) -> String {
+    let name = clean(&call.contact);
+    match call.state {
+        CallState::Calling => format!("📞 Calling {name}… · Ctrl-T hangs up"),
+        CallState::Ringing => format!("📞 {name} is calling · Ctrl-Y answer · Ctrl-T decline"),
+        CallState::Connecting => {
+            format!("📞 Connecting to {name} over a private line (10–30 s)… · Ctrl-T hangs up")
+        }
+        CallState::Talking => {
+            let secs = call.talking.as_secs();
+            let muted = if call.muted { " · MUTED" } else { "" };
+            format!(
+                "📞 On a call with {name} · {}:{:02}{muted} · Ctrl-U mute · Ctrl-T hang up",
+                secs / 60,
+                secs % 60
+            )
+        }
+    }
 }
 
 /// The newest lines that fit in `area` once wrapped, oldest first.

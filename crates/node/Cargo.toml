@@ -8,11 +8,14 @@ description = "The privmsg messenger: MLS-encrypted conversations over the Nym m
 [[bin]]
 name = "privmsg"
 path = "src/main.rs"
-required-features = ["nym"]
+required-features = ["nym", "audio"]
 
 [features]
-default = ["nym"]
+default = ["nym", "audio"]
 nym = ["privmsg-transport/nym"]
+# The computer's microphone and speaker, and an echo canceller, for calls
+# in the desktop app. The phone app brings its own.
+audio = ["dep:cpal", "dep:sonora"]
 
 [dependencies]
 privmsg-crypto = { path = "../crypto" }
@@ -34,6 +37,9 @@ futures = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 qrcode = { workspace = true }
+opus-codec = { workspace = true }
+cpal = { workspace = true, optional = true }
+sonora = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -46,6 +52,8 @@ windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Paused time, for the call's playout timing tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing`.

@@ -11,6 +11,7 @@ use super::*;
 struct Recorder {
     notices: Mutex<Vec<String>>,
     statuses: Mutex<Vec<ConnectionStatus>>,
+    calls: Mutex<Vec<Option<CallView>>>,
 }
 
 impl Listener for Recorder {
@@ -20,6 +21,9 @@ impl Listener for Recorder {
     fn changed(&self) {}
     fn notice(&self, text: String) {
         self.notices.lock().unwrap().push(text);
+    }
+    fn call(&self, call: Option<CallView>) {
+        self.calls.lock().unwrap().push(call);
     }
 }
 
@@ -94,6 +98,78 @@ async fn until_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("timed out waiting for {what}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_phones_call_each_other() {
+    let net = MemoryNetwork::default();
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (alice, alice_hears) = start(a_dir.path(), &net, true);
+    let (bob, bob_hears) = start(b_dir.path(), &net, true);
+    until("online", || {
+        alice.status() == ConnectionStatus::Online && bob.status() == ConnectionStatus::Online
+    })
+    .await;
+    let code = bob.create_invite("alice".into()).await.unwrap();
+    alice.accept_invite(code, "bob".into()).await.unwrap();
+    until("the join", || bob.contacts().len() == 1).await;
+
+    alice.start_call("bob".into()).await.unwrap();
+    assert_eq!(alice.call().unwrap().stage, CallStage::Calling);
+    until("ringing", || {
+        bob.call().is_some_and(|c| c.stage == CallStage::Ringing)
+    })
+    .await;
+    assert_eq!(bob.call().unwrap().display_name, "alice");
+    bob.answer_call().await.unwrap();
+
+    // Both microphones play a tone, the way the app feeds them.
+    let tone: Vec<f32> = (0..480).map(|i| (i as f32 * 0.06).sin() * 0.4).collect();
+    let loudest = |m: &Messenger| {
+        m.pull_speaker(4800)
+            .iter()
+            .fold(0.0f32, |top, s| top.max(s.abs()))
+    };
+    let mut heard = (false, false);
+    for _ in 0..400 {
+        alice.push_mic(tone.clone(), 48_000);
+        bob.push_mic(tone.clone(), 48_000);
+        heard.0 |= loudest(&alice) > 0.1;
+        heard.1 |= loudest(&bob) > 0.1;
+        if heard == (true, true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(heard, (true, true), "both hear each other");
+    assert_eq!(alice.call().unwrap().stage, CallStage::Talking);
+    let talking = |r: &Recorder| {
+        r.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.as_ref().is_some_and(|c| c.stage == CallStage::Talking))
+    };
+    assert!(
+        talking(&alice_hears) && talking(&bob_hears),
+        "the app was told"
+    );
+
+    bob.set_muted(true);
+    until("muted", || bob.call().is_some_and(|c| c.muted)).await;
+    bob.end_call().await.unwrap();
+    assert!(bob.call().is_none());
+    until("the hang-up", || alice.call().is_none()).await;
+    assert_eq!(alice_hears.calls.lock().unwrap().last(), Some(&None));
+    until("the note", || {
+        alice
+            .messages("bob".into())
+            .last()
+            .is_some_and(|m| m.text.starts_with("Call · "))
+    })
+    .await;
+    alice.shutdown().await;
+    bob.shutdown().await;
 }
 
 #[tokio::test]

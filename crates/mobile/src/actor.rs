@@ -10,7 +10,11 @@
 //!
 //! It ends on a shutdown, or on an erase: then it says goodbye to the
 //! contacts (if asked and connected), closes the network and destroys the
-//! profile.
+//! profile. A call in progress is hung up first.
+//!
+//! It also runs the calls (`privmsg_node::call`): their signals come in as
+//! messages, their call lines report here, and the app hears about every
+//! change through `Listener::call`.
 
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -19,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use privmsg_node::app::{Event, Node, MAX_TEXT};
+use privmsg_node::call::{AudioPipe, CallUpdate, Calls};
 use privmsg_node::decoy::Scheduler;
 use privmsg_node::store::Settings;
 use privmsg_node::wire::MessageId;
@@ -29,7 +34,7 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::view::View;
-use crate::{ConnectionStatus, Listener};
+use crate::{CallView, ConnectionStatus, Listener};
 
 /// How long after a failed connection it tries again by itself.
 pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(20);
@@ -84,6 +89,14 @@ pub(crate) enum Command {
     },
     Remove(String, Reply<()>),
     Rotate(String, Reply<()>),
+    /// Call this contact.
+    Call(String, Reply<()>),
+    /// Answer the call that rings.
+    Answer(Reply<()>),
+    /// Hang up, decline, or stop calling.
+    HangUp(Reply<()>),
+    /// Mute was switched (in the audio pipe); tell the app.
+    Muted,
     SafetyNumber(String, Reply<String>),
     MarkRead(String),
     SetSettings(Settings, Reply<()>),
@@ -123,6 +136,7 @@ impl Command {
                 | Command::Erase { .. }
                 | Command::Foreground { .. }
                 | Command::Retry
+                | Command::Muted
         )
     }
 
@@ -139,7 +153,10 @@ impl Command {
             | Command::Delete { reply, .. }
             | Command::Clear { reply, .. }
             | Command::Remove(_, reply)
-            | Command::Rotate(_, reply) => drop(reply.send(error(why))),
+            | Command::Rotate(_, reply)
+            | Command::Call(_, reply)
+            | Command::Answer(reply)
+            | Command::HangUp(reply) => drop(reply.send(error(why))),
             other => debug_assert!(other.is_local(), "refused a local command"),
         }
     }
@@ -149,6 +166,10 @@ impl Command {
 pub(crate) struct Shared {
     pub view: Mutex<View>,
     pub listener: Arc<dyn Listener>,
+    /// The call's audio, moved by the app directly.
+    pub audio: AudioPipe,
+    /// The microphone's sample rate, and what turns it into the call's.
+    pub mic_rate: Mutex<Option<(u32, privmsg_node::call::Resampler)>>,
 }
 
 impl Shared {
@@ -167,6 +188,29 @@ impl Shared {
 
     fn notice(&self, text: String) {
         self.listener.notice(text);
+    }
+
+    /// Tell the app where the call is, after `update` (if anything).
+    fn call(&self, calls: &Calls, update: Option<CallUpdate>) {
+        match &update {
+            Some(CallUpdate::Missed { contact }) => {
+                self.notice(format!("Missed call from {}.", clean(contact)))
+            }
+            Some(CallUpdate::Reconnecting { .. }) => {
+                self.notice("The connection dropped; reconnecting the call…".into())
+            }
+            _ => {}
+        }
+        let call: Option<CallView> = calls.info().map(Into::into);
+        let changed = {
+            let mut view = self.view.lock().expect("view lock");
+            let changed = view.call != call || update.is_some();
+            view.call.clone_from(&call);
+            changed
+        };
+        if changed {
+            self.listener.call(call);
+        }
     }
 }
 
@@ -199,6 +243,7 @@ pub(crate) async fn run<N, F, Fut>(
     Fut: Future<Output = Result<N>>,
 {
     let mut scheduler = new_scheduler(&mut node);
+    let mut calls = Calls::new(shared.audio.clone(), None);
     shared.publish(&node);
 
     // The network. Nothing borrows the node while it comes up.
@@ -283,7 +328,16 @@ pub(crate) async fn run<N, F, Fut>(
         }
         shared.status(ConnectionStatus::Online);
 
-        match online(&mut node, &mut mux, &mut scheduler, &mut commands, &shared).await {
+        match online(
+            &mut node,
+            &mut mux,
+            &mut scheduler,
+            &mut calls,
+            &mut commands,
+            &shared,
+        )
+        .await
+        {
             Flow::Continue => unreachable!("the online loop only returns to reconnect or stop"),
             Flow::Reconnect => {
                 mux.reset(CLOSE_TIMEOUT).await;
@@ -292,6 +346,9 @@ pub(crate) async fn run<N, F, Fut>(
             Flow::End(exit) => break 'session exit,
         }
     };
+    // Leaving ends a call, telling the other side.
+    let update = calls.hang_up(&mut node, &mut mux).await;
+    shared.call(&calls, update);
     end(node, Some(mux), exit, &shared).await;
 }
 
@@ -344,6 +401,7 @@ async fn online<N: Network>(
     node: &mut Node,
     mux: &mut Mux<N>,
     scheduler: &mut Option<Scheduler>,
+    calls: &mut Calls,
     commands: &mut UnboundedReceiver<Command>,
     shared: &Shared,
 ) -> Flow {
@@ -355,20 +413,33 @@ async fn online<N: Network>(
 
         let next_tick = scheduler.as_ref().and_then(Scheduler::next_due);
         let tick_at = next_tick.as_ref().map_or_else(far_future, |(_, at)| *at);
-        // Decoys keep sending by design, so they keep the sender up.
+        // Decoys keep sending by design, so they keep the sender up; so
+        // does a call, which may need to say it ended.
         let idle_limit = node
             .settings()
             .auto_sleep
-            .filter(|_| scheduler.is_none())
+            .filter(|_| scheduler.is_none() && !calls.is_busy())
             .map(|mins| Duration::from_secs(u64::from(mins) * 60));
         let sleep_at = idle_limit.map_or_else(far_future, |limit| last_active + limit);
+        let ring_until = calls.deadline();
 
         tokio::select! {
             msg = mux.recv() => match msg {
                 Ok((slot, msg)) => match node.handle_incoming(mux, &slot, &msg.payload).await {
                     Ok(events) => {
                         for event in events {
-                            announce(shared, scheduler, event);
+                            match event {
+                                Event::Call { contact, signal } => {
+                                    let update = calls.on_signal(node, mux, &contact, signal).await;
+                                    shared.call(calls, update);
+                                }
+                                Event::Gone { ref contact } => {
+                                    let update = calls.forget(node, contact);
+                                    shared.call(calls, update);
+                                    announce(shared, scheduler, event);
+                                }
+                                event => announce(shared, scheduler, event),
+                            }
                         }
                     }
                     Err(e) => tracing::info!("ignored an incoming message: {e:#}"),
@@ -389,7 +460,7 @@ async fn online<N: Network>(
                 if waking {
                     shared.status(ConnectionStatus::Connecting);
                 }
-                let flow = command(node, mux, scheduler, shared, cmd).await;
+                let flow = command(node, mux, scheduler, calls, shared, cmd).await;
                 if waking {
                     shared.status(if mux.is_awake() {
                         ConnectionStatus::Online
@@ -419,6 +490,14 @@ async fn online<N: Network>(
                 mux.sleep().await;
                 shared.status(ConnectionStatus::Resting);
             }
+            news = calls.next() => {
+                let update = calls.on_news(node, mux, news).await;
+                shared.call(calls, update);
+            }
+            _ = tokio::time::sleep_until(ring_until.unwrap_or_else(far_future)), if ring_until.is_some() => {
+                let update = calls.check(node, mux).await;
+                shared.call(calls, update);
+            }
         }
     }
 }
@@ -428,10 +507,27 @@ async fn command<N: Network>(
     node: &mut Node,
     mux: &mut Mux<N>,
     scheduler: &mut Option<Scheduler>,
+    calls: &mut Calls,
     shared: &Shared,
     cmd: Command,
 ) -> Flow {
     match cmd {
+        Command::Call(name, reply) => {
+            let result = calls.start(node, mux, &name).await;
+            shared.call(calls, None);
+            drop(reply.send(result));
+        }
+        Command::Answer(reply) => {
+            let result = calls.accept(mux);
+            shared.call(calls, None);
+            drop(reply.send(result));
+        }
+        Command::HangUp(reply) => {
+            let update = calls.hang_up(node, mux).await;
+            shared.call(calls, update);
+            drop(reply.send(Ok(())));
+        }
+        Command::Muted => shared.call(calls, None),
         Command::Invite(name, reply) => {
             let result = match valid_name(&name) {
                 Ok(name) => node.create_invite(mux, name).await,
@@ -492,7 +588,12 @@ async fn command<N: Network>(
             }
             drop(reply.send(result));
         }
-        Command::Foreground { away } if away >= STALE_AFTER => return Flow::Reconnect,
+        // During a call the app kept running (it plays audio), so its
+        // connections are fine; reconnecting would only delay the call's
+        // signals.
+        Command::Foreground { away } if away >= STALE_AFTER && !calls.is_busy() => {
+            return Flow::Reconnect
+        }
         Command::Shutdown(stop) => return Flow::End(Exit::Stop(Some(stop))),
         cmd => {
             if let ControlFlow::Break(exit) = local(node, Some(cmd), "") {
@@ -542,7 +643,7 @@ fn local(node: &mut Node, cmd: Option<Command>, why: &str) -> ControlFlow<Exit> 
             Ok(()) => return ControlFlow::Break(Exit::Erase { tell, reply }),
             Err(e) => drop(reply.send(Err(e))),
         },
-        Command::Foreground { .. } | Command::Retry => {}
+        Command::Foreground { .. } | Command::Retry | Command::Muted => {}
         Command::Shutdown(stop) => return ControlFlow::Break(Exit::Stop(Some(stop))),
         other => other.refuse(why),
     }
@@ -616,8 +717,9 @@ fn announce(shared: &Shared, scheduler: &mut Option<Scheduler>, event: Event) {
                 s.remove(&contact);
             }
         }
-        // The view shows it; a deleted message leaves no trace.
-        Event::Message { .. } | Event::Deleted { .. } => {}
+        // The view shows it; a deleted message leaves no trace. Calls are
+        // handled by the loop.
+        Event::Message { .. } | Event::Deleted { .. } | Event::Call { .. } => {}
     }
 }
 

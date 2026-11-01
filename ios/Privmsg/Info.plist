@@ -24,6 +24,12 @@
 	<false/>
 	<key>NSCameraUsageDescription</key>
 	<string>To scan a friend's invite code. The picture never leaves your phone.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>For calls. Your voice goes only to the person you call, encrypted, over the private network.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchScreen</key>

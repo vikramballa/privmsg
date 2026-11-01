@@ -26,6 +26,13 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 qrcode = { version = "0.14", default-features = false }
 
+# --- Voice calls: Opus (bundled libopus, built with cmake) for the speech,
+# and on computers the microphone/speaker and an echo canceller (the phone
+# app uses the system's own) ---
+opus-codec = "=0.2.0"
+cpal = "=0.18.2"
+sonora = "=0.2.0"
+
 # --- Swift bindings for the iPhone app (crates/mobile) ---
 uniffi = "0.32"
 
@@ -100,8 +107,34 @@ nym-statistics-common = { path = "vendor/nym-statistics-common" }
 # OpenMLS 0.6 has `debug_assert!(false)` on AEAD failure, so in debug builds a
 # single corrupted or forged packet from the network would panic the node.
 # Release builds return an error there; make debug builds behave the same.
+# Build-time helpers (proc macros, build scripts) are not stripped: on
+# macOS 27 the system `strip` corrupts proc-macro libraries (rustc then
+# fails with "mis-aligned LINKEDIT string pool"). Doesn't touch what ships.
+[profile.release.build-override]
+strip = false
+
+# Test builds without full debugging data: with the Nym tree it ran to
+# tens of GB. Our own code keeps line numbers (enough for backtraces);
+# dependencies get none.
+# (Not stripped either: see the note above on macOS 27's strip.)
+[profile.dev]
+debug = "line-tables-only"
+strip = false
+[profile.dev.package."*"]
+debug = false
+strip = false
+[profile.dev.build-override]
+strip = false
+
 [profile.dev.package.openmls]
 debug-assertions = false
+
+# The call's audio work (Opus, the echo canceller) has to keep up with real
+# time, even in a test build.
+[profile.dev.package.sonora]
+opt-level = 3
+[profile.dev.package.opus-codec]
+opt-level = 3
 
 # Argon2 is deliberately expensive; unoptimised it makes every debug-build
 # unlock (and the test suite) take seconds.

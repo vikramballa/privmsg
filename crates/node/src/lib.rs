@@ -4,6 +4,7 @@
 //! line over it; the fuzz targets drive it directly.
 
 pub mod app;
+pub mod call;
 pub mod decoy;
 pub mod secure;
 pub mod store;

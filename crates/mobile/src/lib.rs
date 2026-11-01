@@ -13,6 +13,12 @@
 //! back through the app's [`Listener`]: connection status, "something
 //! changed, read again", and short notices for the user.
 //!
+//! Calls: the app starts, answers and ends them through the `Messenger`,
+//! hears about them through [`Listener::call`], and moves the audio itself:
+//! microphone samples in with [`Messenger::push_mic`], speaker samples out
+//! with [`Messenger::pull_speaker`] (48 kHz mono, see [`call_sample_rate`]).
+//! The phone's own voice processing does the echo cancelling.
+//!
 //! The profile's device key is sealed by the app's [`KeyVault`] — on the
 //! iPhone, with a key in the Secure Enclave — so erasing the identity
 //! ([`Messenger::erase_identity`]) can destroy it where no copy survives.
@@ -23,6 +29,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use privmsg_node::app::{Node, TIMERS};
+use privmsg_node::call::{AudioPipe, CallInfo, CallState, Resampler, RATE};
 use privmsg_node::secure::harden_process;
 use privmsg_node::store::{shred_dir, Profile, Settings, Vault, MIN_PASSPHRASE};
 use privmsg_node::wire::Invite;
@@ -180,6 +187,50 @@ pub struct TimerChoice {
     pub label: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CallStage {
+    /// We called; it rings on their side (our private line may still be
+    /// coming up).
+    Calling,
+    /// They are calling us: show answer and decline.
+    Ringing,
+    /// We answered; the private line is coming up.
+    Connecting,
+    /// Talking: the microphone and speaker should be on.
+    Talking,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct CallView {
+    /// The contact's `name`.
+    pub contact: String,
+    /// The same, safe to show.
+    pub display_name: String,
+    pub outgoing: bool,
+    pub stage: CallStage,
+    /// Seconds spent talking so far.
+    pub talking_secs: u64,
+    pub muted: bool,
+}
+
+impl From<CallInfo> for CallView {
+    fn from(c: CallInfo) -> Self {
+        CallView {
+            display_name: privmsg_node::clean(&c.contact),
+            contact: c.contact,
+            outgoing: c.outgoing,
+            stage: match c.state {
+                CallState::Calling => CallStage::Calling,
+                CallState::Ringing => CallStage::Ringing,
+                CallState::Connecting => CallStage::Connecting,
+                CallState::Talking => CallStage::Talking,
+            },
+            talking_secs: c.talking.as_secs(),
+            muted: c.muted,
+        }
+    }
+}
+
 /// How the app hears from the messenger. Called on the messenger's own
 /// threads: hop to the main thread before touching the UI.
 #[uniffi::export(with_foreign)]
@@ -189,6 +240,9 @@ pub trait Listener: Send + Sync {
     fn changed(&self);
     /// Something to tell the user ("Alice joined. Say hi!").
     fn notice(&self, text: String);
+    /// The call changed (none: it is over). Start the microphone and
+    /// speaker when it reaches `Talking`, stop them when it ends.
+    fn call(&self, call: Option<CallView>);
 }
 
 /// Guards the profile's device key: the app implements it with a key that
@@ -259,6 +313,13 @@ pub fn timer_choices() -> Vec<TimerChoice> {
 #[uniffi::export]
 pub fn data_mode_mb_per_hour(mode: DataModeChoice) -> u32 {
     DataMode::from(mode).mb_per_hour()
+}
+
+/// Samples per second of the audio passed to [`Messenger::push_mic`] and
+/// taken from [`Messenger::pull_speaker`] (mono).
+#[uniffi::export]
+pub fn call_sample_rate() -> u32 {
+    RATE
 }
 
 /// Whether `text` is an invite code (so a paste can be recognised).
@@ -463,6 +524,65 @@ impl Messenger {
         self.tell(Command::Retry);
     }
 
+    /// Call `name`. It rings for up to a minute; [`Listener::call`] says
+    /// how it goes.
+    pub async fn start_call(&self, name: String) -> Result<(), MobileError> {
+        self.ask(|reply| Command::Call(name, reply)).await
+    }
+
+    /// Answer the call that is ringing.
+    pub async fn answer_call(&self) -> Result<(), MobileError> {
+        self.ask(Command::Answer).await
+    }
+
+    /// Hang up, decline, or stop calling.
+    pub async fn end_call(&self) -> Result<(), MobileError> {
+        self.ask(Command::HangUp).await
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.shared.audio.set_muted(muted);
+        self.tell(Command::Muted);
+    }
+
+    /// The call, if there is one.
+    pub fn call(&self) -> Option<CallView> {
+        self.view().call.clone()
+    }
+
+    /// What the microphone heard: mono, -1 to 1, `rate` samples a second
+    /// (turned into [`call_sample_rate`] here). Hand it over as it comes,
+    /// in blocks of any size. Kept only while talking, and only the last
+    /// fraction of a second.
+    pub fn push_mic(&self, samples: Vec<f32>, rate: u32) {
+        let mut mic = self
+            .shared
+            .mic_rate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if mic.as_ref().is_none_or(|(r, _)| *r != rate) {
+            *mic = Some((rate, Resampler::new(rate, RATE)));
+        }
+        let (_, resampler) = mic.as_mut().expect("just set");
+        if resampler.step() == 1.0 {
+            self.shared.audio.push_mic(&samples);
+        } else {
+            let mut out =
+                Vec::with_capacity(samples.len() * RATE as usize / rate.max(1) as usize + 2);
+            resampler.run(&samples, &mut out);
+            self.shared.audio.push_mic(&out);
+        }
+    }
+
+    /// The next `count` samples to play (silence when there are none), at
+    /// [`call_sample_rate`]. Ask from the audio callback, for exactly what
+    /// it needs: the call sizes its buffer by it.
+    pub fn pull_speaker(&self, count: u32) -> Vec<f32> {
+        let mut out = vec![0.0; count.min(RATE) as usize];
+        self.shared.audio.pull_speaker(&mut out);
+        out
+    }
+
     /// Hand off anything queued and disconnect.
     pub async fn shutdown(&self) {
         let (reply, done) = oneshot::channel();
@@ -492,6 +612,8 @@ impl Messenger {
         let shared = Arc::new(Shared {
             view: Mutex::new(View::default()),
             listener,
+            audio: AudioPipe::default(),
+            mic_rate: Mutex::new(None),
         });
         let (commands, inbox) = unbounded_channel();
         let (ready, started) = std::sync::mpsc::channel();

@@ -7,7 +7,7 @@ use privmsg_node::app::{describe_timer, Node};
 use privmsg_node::store::{Contact, Settings};
 use privmsg_node::wire::MessageId;
 
-use crate::{ConnectionStatus, ContactInfo, DataModeChoice, MessageInfo, SettingsInfo};
+use crate::{CallView, ConnectionStatus, ContactInfo, DataModeChoice, MessageInfo, SettingsInfo};
 
 #[derive(Default)]
 pub(crate) struct View {
@@ -17,6 +17,8 @@ pub(crate) struct View {
     pub invites: Vec<String>,
     pub settings: SettingsInfo,
     pub queued: u32,
+    /// Kept up to date by the loop as the call changes.
+    pub call: Option<CallView>,
 }
 
 impl View {
@@ -42,6 +44,7 @@ impl View {
         if changed {
             *self = View {
                 status: std::mem::take(&mut self.status),
+                call: self.call.take(),
                 contacts,
                 messages,
                 invites,

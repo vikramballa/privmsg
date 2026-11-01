@@ -17,6 +17,7 @@
 //! `store` the encrypted profile, `wire` the formats, `decoy` the decoy
 //! scheduler). This file is the command line; `tui` is the full-screen UI.
 
+mod audio;
 mod keychain;
 mod tui;
 
@@ -951,6 +952,16 @@ async fn receive(
                     Event::Cleared { contact } => {
                         println!("* {} cleared the chat, on both sides", clean(&contact))
                     }
+                    // Calls need the app (plain `privmsg`); here the call
+                    // just rings out on the caller's side.
+                    Event::Call {
+                        contact,
+                        signal: privmsg_node::wire::CallSignal::Offer { .. },
+                    } => println!(
+                        "* {} is calling — open the app (privmsg) to answer calls",
+                        clean(&contact)
+                    ),
+                    Event::Call { .. } => {}
                     Event::Gone { contact } => {
                         println!(
                             "* {} erased their identity; the chat with them is deleted",

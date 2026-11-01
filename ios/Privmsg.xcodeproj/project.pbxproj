@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		08606548B6C3E6E364E1674C /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8FB42A400ACD102FEBDA6397 /* SystemConfiguration.framework */; };
+		268826CC20754DDE3C4C67B1 /* CallAudio.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB35C679781BC9CC63D9E768 /* CallAudio.swift */; };
 		3D75BE83941995C5A87FB04D /* ChatListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 737485FBBE875FECC6A82D12 /* ChatListView.swift */; };
 		3DFCF84FAF5D9077C28994AE /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EF42F240B34CF607C0015241 /* Security.framework */; };
 		3F76C93A19724D90D49074E4 /* LiveTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC8FEB287C46FAAD4AA233D9 /* LiveTests.swift */; };
@@ -16,6 +17,7 @@
 		4D86E358B1BC7609C9117DFE /* PrivmsgCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A454BCF2A4CF5463641B998B /* PrivmsgCore.xcframework */; };
 		539153D8F66809FAA1DA7DEF /* PrivmsgApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D617CFE9F2F9FB5729F1BCE /* PrivmsgApp.swift */; };
 		66B98C31D0269E59B90D7441 /* InviteViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB0AD09ABDC06AB380820255 /* InviteViews.swift */; };
+		7E55C9E113D2487DF17211A3 /* CallScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C35BADD4215B813C884A2AE /* CallScreen.swift */; };
 		7E7792DF9C0BB61261EB4564 /* libresolv.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 95C5197268B53466C16A20BF /* libresolv.tbd */; };
 		84963A7BC69D53EA0213EBCA /* UnlockViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44E76538534014FC30228217 /* UnlockViews.swift */; };
 		8E3D7C99DB109C4E43447693 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = E77E101B440E0FA28B069900 /* AppModel.swift */; };
@@ -41,6 +43,7 @@
 		44E76538534014FC30228217 /* UnlockViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnlockViews.swift; sourceTree = "<group>"; };
 		48E883FD1EA5921DCBA7CF14 /* EraseViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EraseViews.swift; sourceTree = "<group>"; };
 		4F669839D42FB78E3D4561DF /* PrivmsgUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = PrivmsgUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		5C35BADD4215B813C884A2AE /* CallScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallScreen.swift; sourceTree = "<group>"; };
 		5EF5328B71FA57F86E87AB98 /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		5F0EE1417E7D8AFE4FB24CFE /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		737485FBBE875FECC6A82D12 /* ChatListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatListView.swift; sourceTree = "<group>"; };
@@ -56,8 +59,9 @@
 		EB0AD09ABDC06AB380820255 /* InviteViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InviteViews.swift; sourceTree = "<group>"; };
 		EBEB02A7B05AFB08FDA90A8A /* Privacy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Privacy.swift; sourceTree = "<group>"; };
 		EF42F240B34CF607C0015241 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		FB35C679781BC9CC63D9E768 /* CallAudio.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CallAudio.swift; sourceTree = "<group>"; };
 		FC8FEB287C46FAAD4AA233D9 /* LiveTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveTests.swift; sourceTree = "<group>"; };
-		"TEMP_0771EAA7-4D21-434F-9695-EAB7A06F2C7C" /* Privmsg.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Privmsg.xcconfig; sourceTree = "<group>"; };
+		"TEMP_4A0474B5-2512-41FE-8A3A-964BDD0C3F9C" /* Privmsg.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Privmsg.xcconfig; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -127,6 +131,8 @@
 			isa = PBXGroup;
 			children = (
 				E77E101B440E0FA28B069900 /* AppModel.swift */,
+				FB35C679781BC9CC63D9E768 /* CallAudio.swift */,
+				5C35BADD4215B813C884A2AE /* CallScreen.swift */,
 				737485FBBE875FECC6A82D12 /* ChatListView.swift */,
 				5EF5328B71FA57F86E87AB98 /* ChatView.swift */,
 				48E883FD1EA5921DCBA7CF14 /* EraseViews.swift */,
@@ -142,10 +148,10 @@
 			path = Privmsg;
 			sourceTree = "<group>";
 		};
-		"TEMP_698313B6-92A5-4525-A4B7-8FEAC8269108" /* ios */ = {
+		"TEMP_49DE9762-2DC4-49F0-BBDE-768E436AA08A" /* ios */ = {
 			isa = PBXGroup;
 			children = (
-				"TEMP_0771EAA7-4D21-434F-9695-EAB7A06F2C7C" /* Privmsg.xcconfig */,
+				"TEMP_4A0474B5-2512-41FE-8A3A-964BDD0C3F9C" /* Privmsg.xcconfig */,
 			);
 			path = ios;
 			sourceTree = "<group>";
@@ -232,6 +238,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				8E3D7C99DB109C4E43447693 /* AppModel.swift in Sources */,
+				268826CC20754DDE3C4C67B1 /* CallAudio.swift in Sources */,
+				7E55C9E113D2487DF17211A3 /* CallScreen.swift in Sources */,
 				3D75BE83941995C5A87FB04D /* ChatListView.swift in Sources */,
 				CD9922C0930160BB54752875 /* ChatView.swift in Sources */,
 				B7FC4F278F2063631D275FB0 /* EraseViews.swift in Sources */,
@@ -266,7 +274,7 @@
 /* Begin XCBuildConfiguration section */
 		02C9C14EA8F346DC1190CC5B /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = "TEMP_0771EAA7-4D21-434F-9695-EAB7A06F2C7C" /* Privmsg.xcconfig */;
+			baseConfigurationReference = "TEMP_4A0474B5-2512-41FE-8A3A-964BDD0C3F9C" /* Privmsg.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -374,7 +382,7 @@
 		};
 		4F4884994A53919379EFD57C /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = "TEMP_0771EAA7-4D21-434F-9695-EAB7A06F2C7C" /* Privmsg.xcconfig */;
+			baseConfigurationReference = "TEMP_4A0474B5-2512-41FE-8A3A-964BDD0C3F9C" /* Privmsg.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;

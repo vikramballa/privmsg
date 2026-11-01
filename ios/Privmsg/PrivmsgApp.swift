@@ -49,10 +49,19 @@ struct RootView: View {
         case .setup: SetupView()
         case .locked: UnlockView()
         case .ready:
-            if model.screenLocked {
-                ScreenLockView()
-            } else {
-                ChatListView()
+            // A call stays on top of the app's lock screen too, so it can
+            // always be hung up.
+            Group {
+                if model.screenLocked {
+                    ScreenLockView()
+                } else {
+                    ChatListView()
+                }
+            }
+            .overlay {
+                if let call = model.call {
+                    CallScreen(call: call)
+                }
             }
         case .erased(let note): ErasedView(note: note)
         }

@@ -47,6 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup target add ${{ matrix.target }}
+      # Calls use the sound card through ALSA on Linux.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        if: runner.os == 'Linux'
       # No build cache here: release binaries are built from scratch, so a
       # cache written by another run can't end up in them.
       - run: cargo test --workspace --locked

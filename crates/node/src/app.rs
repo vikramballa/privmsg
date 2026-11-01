@@ -59,7 +59,7 @@ use crate::store::{
     Vault, GONE_LIMIT, HISTORY_LIMIT, SEEN_LIMIT,
 };
 use crate::wire::{
-    decode, encode, message_id, valid_address, Envelope, Invite, MessageId, Payload,
+    decode, encode, message_id, valid_address, CallSignal, Envelope, Invite, MessageId, Payload,
 };
 
 /// Longest message text, in bytes, sent or accepted. It keeps every message
@@ -164,6 +164,11 @@ pub enum Event {
     /// gone.
     Gone {
         contact: String,
+    },
+    /// A message about a voice call (see `call::Calls`).
+    Call {
+        contact: String,
+        signal: CallSignal,
     },
 }
 
@@ -522,6 +527,44 @@ impl Node {
             .send_payload(mux, &group_id, &Payload::Text(text.into()))
             .await?;
         self.record(&group_id, true, text, id);
+        self.save()
+    }
+
+    /// Send `signal` about a voice call to `name`. Like every message, it
+    /// waits for the next decoy tick when decoys are on.
+    pub async fn send_call<N: Network>(
+        &mut self,
+        mux: &mut Mux<N>,
+        name: &str,
+        signal: CallSignal,
+    ) -> Result<()> {
+        let group_id = self.contact(name)?.group_id.clone();
+        self.send_payload(mux, &group_id, &Payload::Call(signal))
+            .await
+            .map(drop)
+    }
+
+    /// Note a call in the chat with `name` ("Missed call", "Call, 3:12").
+    /// Only on this device: the contact keeps their own note. A missed call
+    /// counts as unread.
+    pub fn note_call(
+        &mut self,
+        name: &str,
+        outgoing: bool,
+        text: &str,
+        unread: bool,
+    ) -> Result<()> {
+        let idx = self.index(name)?;
+        let group_id = self.state.contacts[idx].group_id.clone();
+        self.record(&group_id, outgoing, text, random());
+        let contact = &mut self.state.contacts[idx];
+        if let Some(entry) = contact.history.last_mut() {
+            // Not a message, so there is nothing to delete on their side.
+            entry.shared = false;
+        }
+        if unread {
+            contact.unread = contact.unread.saturating_add(1);
+        }
         self.save()
     }
 
@@ -1058,6 +1101,13 @@ impl Node {
                 Ok((Some(Event::Timer { contact, after }), false))
             }
             Payload::Timer { .. } => bail!("refused an out-of-range disappearing timer"),
+            Payload::Call(CallSignal::Line { address, .. }) if !valid_address(&address) => {
+                bail!("refused a call line with an invalid address")
+            }
+            Payload::Call(signal) => {
+                let contact = contact.name.clone();
+                Ok((Some(Event::Call { contact, signal }), false))
+            }
             // The caller removes the contact, with the chat.
             Payload::Gone => {
                 let contact = contact.name.clone();

@@ -106,7 +106,7 @@ pub trait Transport {
 /// Opens endpoints by slot name. Each slot has its own keys, so its own
 /// mix address; the same slot always reopens with the same address.
 pub trait Network {
-    type Endpoint: Transport + Send;
+    type Endpoint: Transport + Send + 'static;
 
     /// A receive-only endpoint for `slot`.
     fn open(&self, slot: &str) -> impl Future<Output = Result<Self::Endpoint>> + Send;
@@ -116,7 +116,22 @@ pub trait Network {
 
     /// Destroy a slot's keys for good. Its address can never receive again.
     fn forget(&self, slot: &str) -> Result<()>;
+
+    /// A throwaway endpoint for one voice call (a *call line*): fresh keys
+    /// that only ever live in memory, so its address leads nowhere once the
+    /// call is over. It sends and receives, and sends at once: the caller
+    /// paces it, one packet every [`CALL_GAP`] for as long as it is open, so
+    /// nothing about the call shows in its timing. Independent of `self`
+    /// once made, so it can run on a task of its own.
+    fn open_call(
+        &self,
+    ) -> impl Future<Output = Result<Self::Endpoint>> + Send + 'static + use<Self>;
 }
+
+/// A call line sends one packet this often, from the moment it opens until
+/// it closes: speech, silence and the time before and after the talking all
+/// look the same. Each packet carries this much audio.
+pub const CALL_GAP: Duration = Duration::from_millis(100);
 
 /// The secrets of every Nym client — its keys and gateway registration — as
 /// opaque bytes, kept in memory for the caller to store (privmsg keeps them
@@ -323,6 +338,12 @@ impl<N: Network> Mux<N> {
         ))
     }
 
+    /// A new call line (see [`Network::open_call`]); it doesn't hold on to
+    /// the mux.
+    pub fn open_call(&self) -> impl Future<Output = Result<N::Endpoint>> + Send + 'static + use<N> {
+        self.net.open_call()
+    }
+
     /// Close `slot` (if open) and destroy its keys.
     pub async fn forget(&mut self, slot: &str) -> Result<()> {
         if let Some(i) = self.open.iter().position(|(s, _)| s == slot) {
@@ -511,10 +532,34 @@ pub mod memory {
     pub struct MemoryNetwork {
         inboxes: Arc<Mutex<HashMap<String, Inbox>>>,
         senders: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
         dead: Arc<Mutex<HashSet<String>>>,
+        /// Addresses whose sends mostly get lost: keep one in so many,
+        /// and the count so far.
+        lossy: Arc<Mutex<HashMap<String, (u32, u32)>>>,
     }
 
     impl MemoryNetwork {
+        /// Make `addr`'s connection poor, the way a bad gateway is: only
+        /// one in `keep_one_in` of what it sends arrives, though it stays
+        /// up.
+        pub fn degrade(&self, addr: &str, keep_one_in: u32) {
+            self.lossy
+                .lock()
+                .unwrap()
+                .insert(addr.to_string(), (keep_one_in.max(1), 0));
+        }
+
+        /// Whether this send from `addr` gets lost on a poor connection.
+        fn loses(&self, addr: &str) -> bool {
+            let mut lossy = self.lossy.lock().unwrap();
+            let Some((keep, sent)) = lossy.get_mut(addr) else {
+                return false;
+            };
+            *sent += 1;
+            *sent % *keep != 0
+        }
+
         /// Make `addr`'s connection die the way a Nym client can: it stops
         /// delivering what it is given and reports itself dead.
         pub fn kill(&self, addr: &str) {
@@ -570,6 +615,17 @@ pub mod memory {
             self.inboxes.lock().unwrap().remove(slot);
             Ok(())
         }
+
+        fn open_call(
+            &self,
+        ) -> impl std::future::Future<Output = Result<MemoryTransport>> + Send + 'static + use<>
+        {
+            let net = self.clone();
+            async move {
+                let n = net.calls.fetch_add(1, Ordering::Relaxed);
+                net.connect(&format!("call-{n}"))
+            }
+        }
     }
 
     pub struct MemoryTransport {
@@ -596,7 +652,7 @@ pub mod memory {
 
         async fn send(&mut self, to: &MixAddress, payload: &[u8]) -> Result<()> {
             let frame = pad(payload)?;
-            if self.net.is_dead(&self.addr) {
+            if self.net.is_dead(&self.addr) || self.net.loses(&self.addr) {
                 return Ok(()); // taken, never delivered
             }
             self.net

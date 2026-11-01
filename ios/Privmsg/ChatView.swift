@@ -70,7 +70,18 @@ struct ChatView: View {
         }
         .navigationTitle(contact?.displayName ?? name)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar { ToolbarItem(placement: .topBarTrailing) { menu } }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task { await model.startCall(name) }
+                } label: {
+                    Image(systemName: "phone")
+                }
+                .disabled(model.call != nil)
+                .accessibilityLabel("Call")
+            }
+            ToolbarItem(placement: .topBarTrailing) { menu }
+        }
         .onAppear(perform: reload)
         .onChange(of: model.revision) { _, _ in reload() }
         .alert("Safety number", isPresented: .constant(safetyNumber != nil), presenting: safetyNumber) { _ in
